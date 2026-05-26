@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Optical pH Dashboard</title>
+<style>
+:root {
+  --ink: #151515;
+  --muted: #4b4b4b;
+  --bg1: #f7f1e7;
+  --bg2: #d9efe6;
+  --panel: rgba(255, 255, 255, 0.75);
+  --accent: #1f8a7a;
+  --accent-2: #f2a23a;
+  --line: rgba(0, 0, 0, 0.08);
+  --shadow: 0 18px 40px rgba(0,0,0,0.12);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: "Space Grotesk", "Sora", "Fira Sans", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #fff3da 0%, transparent 60%),
+    radial-gradient(900px 500px at 90% 0%, #cdeee6 0%, transparent 60%),
+    linear-gradient(135deg, var(--bg1), var(--bg2));
+  overflow-x: hidden;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(255,255,255,0.35) 0,
+    rgba(255,255,255,0.35) 2px,
+    transparent 2px,
+    transparent 8px
+  );
+  opacity: 0.4;
+  pointer-events: none;
+}
+.wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 28px 20px 40px;
+  position: relative;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  font-size: 20px;
+}
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.status .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #aaa;
+  box-shadow: 0 0 0 4px rgba(0,0,0,0.06);
+}
+.status.online .dot { background: #2bb673; }
+.status.stale .dot { background: #f2a23a; }
+.grid {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 20px;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 22px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  animation: rise 650ms ease;
+}
+.hero {
+  display: grid;
+  gap: 18px;
+}
+.ph {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.ph .value {
+  font-size: 64px;
+  font-weight: 700;
+  letter-spacing: -1px;
+}
+.ph .unit {
+  font-size: 18px;
+  color: var(--muted);
+}
+.state {
+  display: grid;
+  gap: 6px;
+}
+.state .label {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 1.6px;
+  color: var(--muted);
+}
+.state .name {
+  font-size: 22px;
+  font-weight: 600;
+}
+.state .action {
+  color: var(--muted);
+}
+.progress {
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.08);
+  overflow: hidden;
+}
+.progress span {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 300ms ease;
+}
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.metric {
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(255,255,255,0.65);
+  border: 1px solid var(--line);
+}
+.metric .k {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+.metric .v {
+  margin-top: 6px;
+  font-weight: 600;
+}
+.timeline {
+  display: grid;
+  gap: 12px;
+}
+.step {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid transparent;
+}
+.step .num {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.08);
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+}
+.step.active {
+  border-color: rgba(31,138,122,0.35);
+  background: rgba(31,138,122,0.08);
+}
+.step.active .num {
+  background: var(--accent);
+  color: white;
+}
+.footer {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.cta {
+  appearance: none;
+  border: 0;
+  padding: 12px 20px;
+  border-radius: 999px;
+  background: linear-gradient(120deg, var(--accent), #0b5c52);
+  color: #fff;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  box-shadow: 0 12px 24px rgba(31, 138, 122, 0.25);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+.cta:active {
+  transform: translateY(1px);
+}
+.cta:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+@keyframes rise {
+  from { transform: translateY(10px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+  .ph .value { font-size: 54px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Optical pH Sensor</div>
+    <div id="status" class="status">
+      <span class="dot"></span>
+      <span id="statusText">Connecting...</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="panel hero">
+      <div class="ph">
+        <div id="phValue" class="value">--.--</div>
+        <div class="unit">pH</div>
+      </div>
+      <div class="state">
+        <div class="label">Current Process</div>
+        <div id="stateName" class="name">Waiting</div>
+        <div id="stateAction" class="action">--</div>
+      </div>
+      <div class="controls">
+        <button id="startBtn" class="cta" disabled>Start Cycle</button>
+        <div id="startHint" class="hint">Connecting to device...</div>
+      </div>
+      <div class="progress"><span id="progressBar"></span></div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="k">Progress</div>
+          <div id="progressPct" class="v">0%</div>
+        </div>
+        <div class="metric">
+          <div class="k">Ratio</div>
+          <div id="ratioValue" class="v">--</div>
+        </div>
+        <div class="metric">
+          <div class="k">Absorbance B/G</div>
+          <div id="absValue" class="v">--</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel timeline">
+      <div class="metric" style="margin-bottom: 6px;">
+        <div class="k">Baseline RGB</div>
+        <div id="baselineRgb" class="v">--</div>
+      </div>
+      <div class="metric" style="margin-bottom: 12px;">
+        <div class="k">Sample RGB</div>
+        <div id="sampleRgb" class="v">--</div>
+      </div>
+
+      <div class="step" data-step="1">
+        <div class="num">1</div>
+        <div>Base Fill</div>
+      </div>
+      <div class="step" data-step="2">
+        <div class="num">2</div>
+        <div>Dynamic Blanking</div>
+      </div>
+      <div class="step" data-step="3">
+        <div class="num">3</div>
+        <div>Micro Dose</div>
+      </div>
+      <div class="step" data-step="4">
+        <div class="num">4</div>
+        <div>Agitation Blast</div>
+      </div>
+      <div class="step" data-step="5">
+        <div class="num">5</div>
+        <div>Diffusion Pause</div>
+      </div>
+      <div class="step" data-step="6">
+        <div class="num">6</div>
+        <div>Measurement</div>
+      </div>
+      <div class="step" data-step="7">
+        <div class="num">7</div>
+        <div>Vacuum Drain</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="footer">Live updates via WebSocket. If the indicator stays amber, check WiFi or sensor wiring.</div>
+</div>
+
+<script>
+let ws;
+let lastMessage = 0;
+let wsConnected = false;
+let lastStatus = null;
+
+function connect() {
+  const url = `ws://${location.host}/ws`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    wsConnected = true;
+    setStatus(true, false);
+    updateStartButton(lastStatus);
+  };
+  ws.onclose = () => {
+    wsConnected = false;
+    setStatus(false, false);
+    updateStartButton(lastStatus);
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = (event) => {
+    lastMessage = Date.now();
+    const data = JSON.parse(event.data);
+    updateUI(data);
+  };
+}
+
+function setStatus(online, stale) {
+  const status = document.getElementById("status");
+  const text = document.getElementById("statusText");
+  status.classList.remove("online", "stale");
+  if (online) {
+    status.classList.add(stale ? "stale" : "online");
+    text.textContent = stale ? "Stale data" : "Connected";
+  } else {
+    text.textContent = "Reconnecting";
+  }
+}
+
+function fmtNumber(value, digits) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "--";
+  return Number(value).toFixed(digits);
+}
+
+function updateStartButton(d) {
+  const btn = document.getElementById("startBtn");
+  const hint = document.getElementById("startHint");
+  const sensorOk = d ? !!d.sensorConnected : false;
+  const canStart = d ? !!d.canStart : false;
+  const running = d ? (d.stateId && d.stateId !== 0) : false;
+  const enabled = wsConnected && sensorOk && canStart;
+
+  btn.disabled = !enabled;
+  btn.textContent = running ? "Cycle Running" : "Start Cycle";
+
+  if (!wsConnected) {
+    hint.textContent = "Connecting to device...";
+  } else if (!sensorOk) {
+    hint.textContent = "Sensor offline";
+  } else if (!canStart) {
+    hint.textContent = running ? "Cycle running" : "Not ready";
+  } else {
+    hint.textContent = "Ready to start";
+  }
+}
+
+function updateUI(d) {
+  lastStatus = d;
+  document.getElementById("phValue").textContent = fmtNumber(d.ph, 2);
+  document.getElementById("stateName").textContent = d.state || "--";
+  document.getElementById("stateAction").textContent = d.action || "--";
+
+  const progress = Math.min(1, Math.max(0, d.progress || 0));
+  document.getElementById("progressBar").style.width = `${(progress * 100).toFixed(1)}%`;
+  document.getElementById("progressPct").textContent = `${Math.round(progress * 100)}%`;
+  document.getElementById("ratioValue").textContent = fmtNumber(d.ratio, 3);
+
+  if (d.absorbance) {
+    const bg = `${fmtNumber(d.absorbance.b, 3)}/${fmtNumber(d.absorbance.g, 3)}`;
+    document.getElementById("absValue").textContent = bg;
+  }
+
+  if (d.baselineValid) {
+    document.getElementById("baselineRgb").textContent = `${d.baseline.r}, ${d.baseline.g}, ${d.baseline.b}`;
+  } else {
+    document.getElementById("baselineRgb").textContent = "--";
+  }
+
+  if (d.sampleValid) {
+    document.getElementById("sampleRgb").textContent = `${d.sample.r}, ${d.sample.g}, ${d.sample.b}`;
+  } else {
+    document.getElementById("sampleRgb").textContent = "--";
+  }
+
+  document.querySelectorAll(".step").forEach((step) => {
+    const n = parseInt(step.dataset.step || "0", 10);
+    step.classList.toggle("active", n === d.stateId);
+  });
+
+  setStatus(true, false);
+  updateStartButton(d);
+}
+
+setInterval(() => {
+  if (!lastMessage) return;
+  const stale = Date.now() - lastMessage > 5000;
+  setStatus(true, stale);
+}, 1000);
+
+connect();
+
+document.getElementById("startBtn").addEventListener("click", () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ action: "start" }));
+});
+</script>
+</body>
+</html>
