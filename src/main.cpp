@@ -31,7 +31,10 @@ static uint8_t drainDutyPercent = DRAIN_DUTY_DEFAULT_PERCENT;
 static uint8_t drainPwmDuty = (DRAIN_DUTY_DEFAULT_PERCENT * 255 + 50) / 100;
 
 // ----- Timing (ms) -----
-static const uint32_t BASE_FILL_MS = 24000;
+static const uint32_t BASE_FILL_MS_DEFAULT = 33000;
+static const uint16_t BASE_FILL_SEC_MIN = 5;
+static const uint16_t BASE_FILL_SEC_MAX = 120;
+static uint32_t baseFillMs = BASE_FILL_MS_DEFAULT;
 static const uint32_t BLANKING_WARMUP_MS = 2000;
 static const uint32_t BLANKING_SAMPLE_MS = 1000;
 static const uint32_t MICRO_DOSE_MS = 5500;
@@ -52,8 +55,8 @@ static const float CAL_RATIO_PH55 = 1.10f;
 static const float CAL_RATIO_PH7 = 0.70f;
 
 // ----- WiFi (hardcoded) -----
-static const char *WIFI_SSID = "YOUR_SSID";
-static const char *WIFI_PASS = "YOUR_PASSWORD";
+static const char *WIFI_SSID = "Sahan’s iPhone";
+static const char *WIFI_PASS = "1234567889";
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t WIFI_RETRY_MS = 10000;
 
@@ -119,8 +122,19 @@ static uint8_t clampPercent(int value) {
   return static_cast<uint8_t>(value);
 }
 
+static uint16_t clampSeconds(int value, uint16_t minValue, uint16_t maxValue) {
+  if (value < static_cast<int>(minValue)) return minValue;
+  if (value > static_cast<int>(maxValue)) return maxValue;
+  return static_cast<uint16_t>(value);
+}
+
 static uint8_t percentToDuty(uint8_t percent) {
   return static_cast<uint8_t>((percent * 255 + 50) / 100);
+}
+
+static void setBaseFillSeconds(int seconds) {
+  uint16_t clamped = clampSeconds(seconds, BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
+  baseFillMs = static_cast<uint32_t>(clamped) * 1000;
 }
 
 static void setDrainDutyPercent(uint8_t percent) {
@@ -246,7 +260,7 @@ static const char *getStateAction(ProcessState state) {
 
 static uint32_t getStateDuration(ProcessState state) {
     switch (state) {
-        case ProcessState::BASE_FILL: return BASE_FILL_MS;
+    case ProcessState::BASE_FILL: return baseFillMs;
         case ProcessState::BLANKING: return BLANKING_WARMUP_MS + BLANKING_SAMPLE_MS;
         case ProcessState::MICRO_DOSE: return MICRO_DOSE_MS;
         case ProcessState::AGITATION: return AGITATION_MS;
@@ -276,6 +290,8 @@ static String buildStatusJson() {
     doc["durationMs"] = duration;
     doc["progress"] = progress;
     doc["remainingMs"] = duration > elapsed ? (duration - elapsed) : 0;
+    doc["baseFillMs"] = baseFillMs;
+    doc["baseFillSec"] = baseFillMs / 1000;
     doc["baselineValid"] = baselineValid;
     doc["sampleValid"] = sampleValid;
     doc["drainDutyPercent"] = drainDutyPercent;
@@ -421,12 +437,19 @@ static void setupServer() {
     });
 
     server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (request->hasParam("baseFillSec")) {
+        int seconds = request->getParam("baseFillSec")->value().toInt();
+        setBaseFillSeconds(seconds);
+      }
+
       if (request->hasParam("drainDuty")) {
         int percent = request->getParam("drainDuty")->value().toInt();
         setDrainDutyPercent(clampPercent(percent));
       }
 
       JsonDocument doc;
+      doc["baseFillMs"] = baseFillMs;
+      doc["baseFillSec"] = baseFillMs / 1000;
       doc["drainDutyPercent"] = drainDutyPercent;
       doc["drainDutyRaw"] = drainPwmDuty;
       String payload;
@@ -442,7 +465,7 @@ static void runStateMachine() {
 
     switch (currentState) {
         case ProcessState::BASE_FILL:
-            if (now - stateStartMs >= BASE_FILL_MS) {
+          if (now - stateStartMs >= baseFillMs) {
                 setState(ProcessState::BLANKING);
             }
             break;
