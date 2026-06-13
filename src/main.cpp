@@ -5,7 +5,11 @@
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "Adafruit_TCS34725.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <cmath>
 #include <math.h>
 
 // ----- Pinout -----
@@ -15,6 +19,7 @@ static const uint8_t LED_PIN = 2;
 static const uint8_t PUMP1_PIN = 4;
 static const uint8_t PUMP2_PIN = 32;
 static const uint8_t PUMP3_PIN = 18;
+static const uint8_t BUTTON_PIN = 34; // START_BTN (input-only on ESP32)
 
 // ----- PWM (Pump 2) -----
 static const uint8_t PUMP2_PWM_CHANNEL = 0;
@@ -50,9 +55,9 @@ static const uint8_t SAMPLE_COUNT = 10;
 static const uint16_t SAMPLE_SPACING_MS = 100;
 
 // ----- Calibration (placeholder values) -----
-static const float CAL_RATIO_PH4 = 1.60f;
-static const float CAL_RATIO_PH55 = 1.10f;
-static const float CAL_RATIO_PH7 = 0.70f;
+static float CAL_RATIO_PH4 = 1.60f;
+static float CAL_RATIO_PH55 = 1.10f;
+static float CAL_RATIO_PH7 = 0.70f;
 
 // ----- WiFi (hardcoded) -----
 static const char *WIFI_SSID = "Sahan’s iPhone";
@@ -68,6 +73,8 @@ Adafruit_TCS34725 tcs = Adafruit_TCS34725(
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 static bool fsReady = false;
+static Preferences preferences;
+static bool preferencesReady = false;
 
 // ----- FSM -----
 enum class ProcessState : uint8_t {
@@ -102,9 +109,25 @@ static unsigned long lastSensorCheckMs = 0;
 static unsigned long lastWifiAttemptMs = 0;
 
 static bool sensorConnected = false;
+static bool sensorHealthy = true;
+static bool sensorReadError = false;
 static bool baselineValid = false;
 static bool sampleValid = false;
 static bool wifiConnected = false;
+
+// OLED / display
+static const int SCREEN_WIDTH = 128;
+static const int SCREEN_HEIGHT = 64;
+static Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+static bool oledPresent = false;
+static unsigned long lastDisplayUpdateMs = 0;
+static const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 500;
+
+// Button debounce
+static const unsigned long BUTTON_DEBOUNCE_MS = 50;
+static int lastButtonRead = HIGH;
+static int stableButtonState = HIGH;
+static unsigned long lastButtonChangeMs = 0;
 
 static RawReading baseline = {0, 0, 0, 0};
 static RawReading sample = {0, 0, 0, 0};
@@ -132,17 +155,80 @@ static uint8_t percentToDuty(uint8_t percent) {
   return static_cast<uint8_t>((percent * 255 + 50) / 100);
 }
 
-static void setBaseFillSeconds(int seconds) {
-  uint16_t clamped = clampSeconds(seconds, BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
-  baseFillMs = static_cast<uint32_t>(clamped) * 1000;
+static void saveSettings() {
+  if (!preferencesReady) {
+    return;
+  }
+
+  preferences.putUInt("baseFillMs", baseFillMs);
+  preferences.putUChar("drainDuty", drainDutyPercent);
+  preferences.putFloat("calPh4", CAL_RATIO_PH4);
+  preferences.putFloat("calPh55", CAL_RATIO_PH55);
+  preferences.putFloat("calPh7", CAL_RATIO_PH7);
 }
 
-static void setDrainDutyPercent(uint8_t percent) {
+static void loadSettings() {
+  if (!preferencesReady) {
+    return;
+  }
+
+  uint32_t storedBaseFillMs = preferences.getUInt("baseFillMs", BASE_FILL_MS_DEFAULT);
+  uint16_t storedBaseFillSec = clampSeconds(static_cast<int>(storedBaseFillMs / 1000), BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
+  baseFillMs = static_cast<uint32_t>(storedBaseFillSec) * 1000;
+
+  drainDutyPercent = clampPercent(preferences.getUChar("drainDuty", DRAIN_DUTY_DEFAULT_PERCENT));
+  drainPwmDuty = percentToDuty(drainDutyPercent);
+
+  float storedPh4 = preferences.getFloat("calPh4", CAL_RATIO_PH4);
+  float storedPh55 = preferences.getFloat("calPh55", CAL_RATIO_PH55);
+  float storedPh7 = preferences.getFloat("calPh7", CAL_RATIO_PH7);
+  if (isfinite(storedPh4) && isfinite(storedPh55) && isfinite(storedPh7) &&
+      storedPh4 > storedPh55 && storedPh55 > storedPh7) {
+    CAL_RATIO_PH4 = storedPh4;
+    CAL_RATIO_PH55 = storedPh55;
+    CAL_RATIO_PH7 = storedPh7;
+  } else {
+    Serial.println("Calibration values invalid or missing; keeping defaults.");
+  }
+}
+
+static void setBaseFillSeconds(int seconds, bool persist = true) {
+  uint16_t clamped = clampSeconds(seconds, BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
+  baseFillMs = static_cast<uint32_t>(clamped) * 1000;
+  if (persist) {
+    saveSettings();
+  }
+}
+
+static void setDrainDutyPercent(uint8_t percent, bool persist = true) {
   drainDutyPercent = percent;
   drainPwmDuty = percentToDuty(percent);
   if (currentState == ProcessState::DRAIN) {
     ledcWrite(PUMP3_PWM_CHANNEL, drainPwmDuty);
   }
+  if (persist) {
+    saveSettings();
+  }
+}
+
+static bool setCalibrationRatios(float ph4, float ph55, float ph7, bool persist = true) {
+  if (!isfinite(ph4) || !isfinite(ph55) || !isfinite(ph7)) {
+    return false;
+  }
+
+  if (!(ph4 > ph55 && ph55 > ph7)) {
+    return false;
+  }
+
+  CAL_RATIO_PH4 = ph4;
+  CAL_RATIO_PH55 = ph55;
+  CAL_RATIO_PH7 = ph7;
+
+  if (persist) {
+    saveSettings();
+  }
+
+  return true;
 }
 
 static void setAllOutputsOff() {
@@ -170,16 +256,26 @@ static void ledOn(bool on) {
 
 static RawReading readAverageRaw(uint8_t samples, uint16_t spacingMs) {
     RawReading out = {0, 0, 0, 0};
-    if (samples == 0) return out;
+  sensorReadError = false;
+  if (samples == 0 || !sensorConnected || !sensorHealthy) return out;
 
-    uint32_t sumR = 0;
-    uint32_t sumG = 0;
-    uint32_t sumB = 0;
-    uint32_t sumC = 0;
+  Wire.setTimeOut(50);
+
+  float sumR = 0.0f;
+  float sumG = 0.0f;
+  float sumB = 0.0f;
+  float sumC = 0.0f;
 
     for (uint8_t i = 0; i < samples; i++) {
         uint16_t r, g, b, c;
         tcs.getRawData(&r, &g, &b, &c);
+    if (r == 0 && g == 0 && b == 0 && c == 0) {
+      sensorHealthy = false;
+      sensorReadError = true;
+      sensorConnected = false;
+      Serial.println("TCS34725 returned zeroed reading.");
+      return out;
+    }
         sumR += r;
         sumG += g;
         sumB += b;
@@ -187,10 +283,10 @@ static RawReading readAverageRaw(uint8_t samples, uint16_t spacingMs) {
         delay(spacingMs);
     }
 
-    out.r = sumR / samples;
-    out.g = sumG / samples;
-    out.b = sumB / samples;
-    out.c = sumC / samples;
+  out.r = static_cast<uint16_t>(sumR / samples + 0.5f);
+  out.g = static_cast<uint16_t>(sumG / samples + 0.5f);
+  out.b = static_cast<uint16_t>(sumB / samples + 0.5f);
+  out.c = static_cast<uint16_t>(sumC / samples + 0.5f);
     return out;
 }
 
@@ -198,15 +294,18 @@ static float safeTransmittance(float test, float base) {
     if (base <= 0.0f) return 0.0001f;
     float t = test / base;
     if (t < 0.0001f) t = 0.0001f;
-    if (t > 1.0f) t = 1.0f;
+  if (t > 1.0f) {
+    Serial.println("Warning: test exceeded baseline; clamping transmittance to 1.0.");
+    t = 1.0f;
+  }
     return t;
 }
 
 static Absorbance computeAbsorbance(const RawReading &base, const RawReading &test) {
     Absorbance a;
-    a.r = -log10f(safeTransmittance((float)test.r, (float)base.r));
-    a.g = -log10f(safeTransmittance((float)test.g, (float)base.g));
-    a.b = -log10f(safeTransmittance((float)test.b, (float)base.b));
+  a.r = -std::log10(safeTransmittance((float)test.r, (float)base.r));
+  a.g = -std::log10(safeTransmittance((float)test.g, (float)base.g));
+  a.b = -std::log10(safeTransmittance((float)test.b, (float)base.b));
     return a;
 }
 
@@ -218,8 +317,8 @@ static float computeRatio(const Absorbance &a) {
 static float mapRatioToPH(float ratio) {
     if (isnan(ratio)) return NAN;
 
-    if (ratio >= CAL_RATIO_PH4) return 4.0f;
-    if (ratio <= CAL_RATIO_PH7) return 7.0f;
+  if (ratio >= CAL_RATIO_PH4) return 4.0f;
+  if (ratio <= CAL_RATIO_PH7) return 7.0f;
 
     if (ratio >= CAL_RATIO_PH55) {
         float t = (ratio - CAL_RATIO_PH55) / (CAL_RATIO_PH4 - CAL_RATIO_PH55);
@@ -296,8 +395,15 @@ static String buildStatusJson() {
     doc["sampleValid"] = sampleValid;
     doc["drainDutyPercent"] = drainDutyPercent;
     doc["drainDutyRaw"] = drainPwmDuty;
+    doc["sensorHealthy"] = sensorHealthy;
+    doc["sensorReadError"] = sensorReadError;
     doc["sensorConnected"] = sensorConnected;
     doc["canStart"] = sensorConnected && currentState == ProcessState::IDLE;
+
+    JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
+    calibrationObj["ph4"] = CAL_RATIO_PH4;
+    calibrationObj["ph55"] = CAL_RATIO_PH55;
+    calibrationObj["ph7"] = CAL_RATIO_PH7;
 
     if (isnan(lastPh)) {
         doc["ph"] = nullptr;
@@ -425,7 +531,7 @@ static void setupServer() {
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
       if (!fsReady || !LittleFS.exists("/index.html")) {
-        request->send(404, "text/plain", "Not Found");
+        request->send(404, "text/plain", "Dashboard UI is missing. Upload LittleFS data/index.html.");
         return;
       }
       request->send(LittleFS, "/index.html", "text/html");
@@ -452,8 +558,46 @@ static void setupServer() {
       doc["baseFillSec"] = baseFillMs / 1000;
       doc["drainDutyPercent"] = drainDutyPercent;
       doc["drainDutyRaw"] = drainPwmDuty;
+      JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
+      calibrationObj["ph4"] = CAL_RATIO_PH4;
+      calibrationObj["ph55"] = CAL_RATIO_PH55;
+      calibrationObj["ph7"] = CAL_RATIO_PH7;
       String payload;
       serializeJson(doc, payload);
+      broadcastStatus();
+      request->send(200, "application/json", payload);
+    });
+
+    server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (!request->hasParam("ph4Ratio") || !request->hasParam("ph55Ratio") || !request->hasParam("ph7Ratio")) {
+        JsonDocument errorDoc;
+        errorDoc["error"] = "Missing calibration ratios";
+        String payload;
+        serializeJson(errorDoc, payload);
+        request->send(400, "application/json", payload);
+        return;
+      }
+
+      float ph4 = request->getParam("ph4Ratio")->value().toFloat();
+      float ph55 = request->getParam("ph55Ratio")->value().toFloat();
+      float ph7 = request->getParam("ph7Ratio")->value().toFloat();
+      if (!setCalibrationRatios(ph4, ph55, ph7)) {
+        JsonDocument errorDoc;
+        errorDoc["error"] = "Calibration ratios must be finite and strictly descending";
+        String payload;
+        serializeJson(errorDoc, payload);
+        request->send(400, "application/json", payload);
+        return;
+      }
+
+      JsonDocument doc;
+      JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
+      calibrationObj["ph4"] = CAL_RATIO_PH4;
+      calibrationObj["ph55"] = CAL_RATIO_PH55;
+      calibrationObj["ph7"] = CAL_RATIO_PH7;
+      String payload;
+      serializeJson(doc, payload);
+      broadcastStatus();
       request->send(200, "application/json", payload);
     });
 
@@ -473,6 +617,12 @@ static void runStateMachine() {
         case ProcessState::BLANKING:
             if (!baselineValid && (now - stateStartMs >= BLANKING_WARMUP_MS)) {
                 baseline = readAverageRaw(SAMPLE_COUNT, SAMPLE_SPACING_MS);
+            if (sensorReadError) {
+              baselineValid = false;
+              ledOn(false);
+              setState(ProcessState::IDLE);
+              break;
+            }
                 baselineValid = true;
                 ledOn(false);
                 setState(ProcessState::MICRO_DOSE);
@@ -500,10 +650,19 @@ static void runStateMachine() {
         case ProcessState::MEASURE:
             if (!sampleValid && (now - stateStartMs >= MEASURE_WARMUP_MS)) {
                 sample = readAverageRaw(SAMPLE_COUNT, SAMPLE_SPACING_MS);
+            if (sensorReadError) {
+              sampleValid = false;
+              ledOn(false);
+              lastAbs = {NAN, NAN, NAN};
+              lastRatio = NAN;
+              lastPh = NAN;
+              setState(ProcessState::IDLE);
+              break;
+            }
                 sampleValid = true;
                 ledOn(false);
 
-                if (baselineValid) {
+            if (baselineValid) {
                     lastAbs = computeAbsorbance(baseline, sample);
                     lastRatio = computeRatio(lastAbs);
                     lastPh = mapRatioToPH(lastRatio);
@@ -541,6 +700,13 @@ void setup() {
     pinMode(PUMP3_PIN, OUTPUT);
     setAllOutputsOff();
 
+    preferencesReady = preferences.begin("optph", false);
+    if (!preferencesReady) {
+      Serial.println("Preferences mount failed. Settings will not persist.");
+    } else {
+      loadSettings();
+    }
+
     ledcSetup(PUMP2_PWM_CHANNEL, PUMP2_PWM_FREQ, PUMP2_PWM_RES);
     ledcAttachPin(PUMP2_PIN, PUMP2_PWM_CHANNEL);
     ledcWrite(PUMP2_PWM_CHANNEL, 0);
@@ -550,6 +716,35 @@ void setup() {
     ledcWrite(PUMP3_PWM_CHANNEL, 0);
 
     Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setTimeOut(50);
+
+    // Button initialisation (external 10k pull-up expected)
+    pinMode(BUTTON_PIN, INPUT);
+
+    // I2C bus scan to detect OLED and other devices
+    Serial.println("Scanning I2C bus for devices...");
+    oledPresent = false;
+    for (uint8_t addr = 3; addr < 0x78; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        Serial.printf("I2C device found at 0x%02X\n", addr);
+        if (addr == 0x3C) {
+          oledPresent = true;
+        }
+      }
+    }
+
+    if (oledPresent) {
+      if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("SSD1306 OLED init failed — continuing without display.");
+        oledPresent = false;
+      } else {
+        Serial.println("SSD1306 OLED initialized.");
+        display.clearDisplay();
+        display.display();
+        lastDisplayUpdateMs = millis();
+      }
+    }
 
     Serial.println("Optical pH Sensor booting...");
     sensorConnected = tcs.begin();
@@ -558,6 +753,7 @@ void setup() {
         Serial.println("TCS34725 not found. Will retry.");
     } else {
         tcs.setInterrupt(true);
+      sensorHealthy = true;
     }
 
     WiFi.mode(WIFI_STA);
@@ -613,6 +809,7 @@ void loop() {
             lastSensorCheckMs = now;
             if (tcs.begin()) {
                 sensorConnected = true;
+                sensorHealthy = true;
                 tcs.setInterrupt(true);
                 Serial.println("TCS34725 connected.");
               setState(ProcessState::IDLE);
@@ -628,5 +825,55 @@ void loop() {
     if (now - lastBroadcastMs >= 1000) {
         lastBroadcastMs = now;
         broadcastStatus();
+    }
+
+    // Button polling with debounce (external pull-up, active LOW)
+    now = millis();
+    int reading = digitalRead(BUTTON_PIN);
+    if (reading != lastButtonRead) {
+      lastButtonChangeMs = now;
+      lastButtonRead = reading;
+    }
+
+    if ((now - lastButtonChangeMs) > BUTTON_DEBOUNCE_MS) {
+      if (reading != stableButtonState) {
+        stableButtonState = reading;
+        if (stableButtonState == LOW) {
+          Serial.println("START_BTN pressed");
+          if (sensorConnected && currentState == ProcessState::IDLE) {
+            setState(ProcessState::BASE_FILL);
+          }
+        }
+      }
+    }
+
+    // OLED update (lightweight)
+    if (oledPresent && (now - lastDisplayUpdateMs >= DISPLAY_UPDATE_INTERVAL_MS)) {
+      lastDisplayUpdateMs = now;
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.setTextSize(2);
+      if (isnan(lastPh)) {
+        display.print("pH: --");
+      } else {
+        display.print("pH:");
+        display.print(lastPh, 2);
+      }
+
+      display.setTextSize(1);
+      display.setCursor(0, 28);
+      uint8_t r8 = (sample.r >> 8) & 0xFF;
+      uint8_t g8 = (sample.g >> 8) & 0xFF;
+      uint8_t b8 = (sample.b >> 8) & 0xFF;
+      char rgbBuf[16];
+      sprintf(rgbBuf, "RGB:#%02X%02X%02X", r8, g8, b8);
+      display.print(rgbBuf);
+
+      display.setCursor(0, 48);
+      display.print("W:");
+      display.print(wifiConnected ? "OK" : "--");
+
+      display.display();
     }
 }
