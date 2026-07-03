@@ -200,6 +200,48 @@ header {
   gap: 12px;
   flex-wrap: wrap;
 }
+.config-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.config-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+}
+.config-input {
+  width: 90px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.8);
+  font-weight: 600;
+  color: var(--ink);
+}
+.config-button {
+  appearance: none;
+  border: 0;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(31, 138, 122, 0.12);
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+.config-button:active {
+  transform: translateY(1px);
+}
+.config-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+.config-hint.error {
+  color: #b54a3b;
+}
 .cta {
   appearance: none;
   border: 0;
@@ -259,6 +301,22 @@ header {
       <div class="controls">
         <button id="startBtn" class="cta" disabled>Start Cycle</button>
         <div id="startHint" class="hint">Connecting to device...</div>
+      </div>
+      <div class="config-row">
+        <label class="config-label" for="baseFillInput">Base Fill (s)</label>
+        <input id="baseFillInput" class="config-input" type="number" min="5" max="120" step="1" value="33"/>
+        <button id="baseFillApply" class="config-button" type="button">Apply</button>
+        <div id="baseFillHint" class="config-hint">--</div>
+      </div>
+      <div class="config-row">
+        <label class="config-label" for="calPh4Input">Cal pH 4</label>
+        <input id="calPh4Input" class="config-input" type="number" step="0.001" value="1.600"/>
+        <label class="config-label" for="calPh55Input">Cal pH 5.5</label>
+        <input id="calPh55Input" class="config-input" type="number" step="0.001" value="1.100"/>
+        <label class="config-label" for="calPh7Input">Cal pH 7</label>
+        <input id="calPh7Input" class="config-input" type="number" step="0.001" value="0.700"/>
+        <button id="calApply" class="config-button" type="button">Save Cal</button>
+        <div id="calHint" class="config-hint">--</div>
       </div>
       <div class="progress"><span id="progressBar"></span></div>
       <div class="metrics">
@@ -326,6 +384,14 @@ let ws;
 let lastMessage = 0;
 let wsConnected = false;
 let lastStatus = null;
+const baseFillInput = document.getElementById("baseFillInput");
+const baseFillApply = document.getElementById("baseFillApply");
+const baseFillHint = document.getElementById("baseFillHint");
+const calPh4Input = document.getElementById("calPh4Input");
+const calPh55Input = document.getElementById("calPh55Input");
+const calPh7Input = document.getElementById("calPh7Input");
+const calApply = document.getElementById("calApply");
+const calHint = document.getElementById("calHint");
 
 function connect() {
   const url = `ws://${location.host}/ws`;
@@ -366,6 +432,103 @@ function fmtNumber(value, digits) {
   return Number(value).toFixed(digits);
 }
 
+function setBaseFillHint(text, isError) {
+  baseFillHint.textContent = text;
+  baseFillHint.classList.toggle("error", !!isError);
+}
+
+function setCalHint(text, isError) {
+  calHint.textContent = text;
+  calHint.classList.toggle("error", !!isError);
+}
+
+function updateBaseFillUI(d) {
+  if (!d || typeof d.baseFillSec !== "number") return;
+  const sec = Math.round(d.baseFillSec);
+  if (document.activeElement !== baseFillInput) {
+    baseFillInput.value = sec;
+  }
+}
+
+function updateCalibrationUI(d) {
+  if (!d || !d.calibration) return;
+  const cal = d.calibration;
+  if (typeof cal.ph4 === "number" && document.activeElement !== calPh4Input) {
+    calPh4Input.value = Number(cal.ph4).toFixed(3);
+  }
+  if (typeof cal.ph55 === "number" && document.activeElement !== calPh55Input) {
+    calPh55Input.value = Number(cal.ph55).toFixed(3);
+  }
+  if (typeof cal.ph7 === "number" && document.activeElement !== calPh7Input) {
+    calPh7Input.value = Number(cal.ph7).toFixed(3);
+  }
+}
+
+function applyBaseFill() {
+  const rawValue = parseInt(baseFillInput.value, 10);
+  if (!Number.isFinite(rawValue)) {
+    setBaseFillHint("Enter a number", true);
+    return;
+  }
+  const clamped = Math.min(120, Math.max(5, rawValue));
+  if (clamped !== rawValue) {
+    baseFillInput.value = clamped;
+  }
+  setBaseFillHint("Applying...", false);
+  fetch(`/api/config?baseFillSec=${clamped}`)
+    .then((res) => {
+      if (!res.ok) {
+        throw new Error("Request failed");
+      }
+      return res.json();
+    })
+    .then((payload) => {
+      if (payload && typeof payload.baseFillSec === "number") {
+        const sec = Math.round(payload.baseFillSec);
+        baseFillInput.value = sec;
+        setBaseFillHint(`Saved ${sec} s`, false);
+      } else {
+        setBaseFillHint("Saved", false);
+      }
+    })
+    .catch(() => {
+      setBaseFillHint("Failed to update", true);
+    });
+}
+
+function applyCalibration() {
+  const ph4 = Number.parseFloat(calPh4Input.value);
+  const ph55 = Number.parseFloat(calPh55Input.value);
+  const ph7 = Number.parseFloat(calPh7Input.value);
+
+  if (![ph4, ph55, ph7].every(Number.isFinite)) {
+    setCalHint("Enter three numbers", true);
+    return;
+  }
+
+  setCalHint("Saving...", false);
+  fetch(`/api/calibrate?ph4Ratio=${encodeURIComponent(ph4)}&ph55Ratio=${encodeURIComponent(ph55)}&ph7Ratio=${encodeURIComponent(ph7)}`)
+    .then((res) => {
+      if (!res.ok) {
+        return res.json().then((payload) => {
+          throw new Error(payload && payload.error ? payload.error : "Request failed");
+        });
+      }
+      return res.json();
+    })
+    .then((payload) => {
+      if (payload && payload.calibration) {
+        updateCalibrationUI(payload);
+        setCalHint("Calibration saved", false);
+      } else {
+        setCalHint("Calibration saved", false);
+      }
+    })
+    .catch((error) => {
+      setCalHint(error.message || "Failed to update", true);
+    });
+}
+
 function updateStartButton(d) {
   const btn = document.getElementById("startBtn");
   const hint = document.getElementById("startHint");
@@ -393,6 +556,8 @@ function updateUI(d) {
   document.getElementById("phValue").textContent = fmtNumber(d.ph, 2);
   document.getElementById("stateName").textContent = d.state || "--";
   document.getElementById("stateAction").textContent = d.action || "--";
+  updateBaseFillUI(d);
+  updateCalibrationUI(d);
 
   const progress = Math.min(1, Math.max(0, d.progress || 0));
   document.getElementById("progressBar").style.width = `${(progress * 100).toFixed(1)}%`;
@@ -436,6 +601,25 @@ connect();
 document.getElementById("startBtn").addEventListener("click", () => {
   if (!ws || ws.readyState !== 1) return;
   ws.send(JSON.stringify({ action: "start" }));
+});
+
+baseFillApply.addEventListener("click", applyBaseFill);
+baseFillInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    applyBaseFill();
+  }
+});
+calApply.addEventListener("click", applyCalibration);
+[
+  calPh4Input,
+  calPh55Input,
+  calPh7Input,
+].forEach((input) => {
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      applyCalibration();
+    }
+  });
 });
 </script>
 </body>

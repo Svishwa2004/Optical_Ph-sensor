@@ -37,7 +37,7 @@ The ESP32 orchestrates the entire process. Here is how the physical hardware con
 | TCS34725 Sensor | GPIO 22 (SCL) | I2C Clock | Connects to SCL on sensor. |
 | Dual LEDs (6500K+3000K) | GPIO 2 | Digital Out | Triggers the 2N2222 Transistor Base. |
 | Pump 1 (Water Fill) | GPIO 4 | Digital Out | Triggers MOSFET 1 Gate. |
-| Pump 2 (Dye Dose) | GPIO 5 | PWM Out | Triggers MOSFET 2 Gate (35% Duty Cycle). |
+| Pump 2 (Dye Dose) | GPIO 32 | PWM Out | Triggers MOSFET 2 Gate (35% Duty Cycle). |
 | Pump 3 (Vacuum Drain) | GPIO 18 | PWM Out | 5 kHz PWM, default 40% duty (runtime adjustable). |
 
 _(Note: Every pump motor MUST have a 1N4007 flyback diode soldered across its terminals to prevent voltage spikes from destroying the MOSFETs)._
@@ -64,7 +64,7 @@ Once the system boots, the ESP32 enters an infinite loop, executing a perfect ch
 ### STATE 3: The Precision Micro-Dose
 
 *   **Objective:** Inject the exact required amount of Bromothymol Blue + Methyl Red indicator dye.
-*   **Hardware Action:** ESP32 activates the PWM channel on GPIO 5 at a **35% duty cycle**. Pump 2 (NKP) turns on, but its internal motor is electronically geared down to run incredibly slowly (~13 mL/min).
+*   **Hardware Action:** ESP32 activates the PWM channel on GPIO 32 at a **35% duty cycle**. Pump 2 (NKP) turns on, but its internal motor is electronically geared down to run incredibly slowly (~13 mL/min).
 *   **Firmware Timing:** The pump runs for exactly **5,500 milliseconds (5.5s)**.
 *   **Volume Delivered:** **1.19 mL** of dye.
 *   **Physical Reality:** The highly concentrated dye drops from the top port and sinks heavily into the center of the rectangular chamber, resting on the bottom. ESP32 sets PWM to 0 to stop the pump.

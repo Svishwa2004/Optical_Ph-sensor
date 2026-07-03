@@ -1,3 +1,7 @@
 {
-  "C_Cpp.default.configurationProvider": "platformio.platformio-ide"
+  "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+  "clangd.arguments": [
+    "--query-driver=C:/Users/USER/.platformio/packages/toolchain-*/bin/*,C:/Users/USER/.platformio/packages/tool-*/bin/*",
+    "--compile-commands-dir=d:/ITM/Acedemic/Projects/1 - Hardware project/GreenHouse/Sensor/Custom Ph Sensor/custome_Ph/.cache/clangd"
+  ]
 }

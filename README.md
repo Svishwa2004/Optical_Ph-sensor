@@ -8,6 +8,7 @@ ESP32 firmware and web UI for a color-based optical pH sensor. The system runs a
 - TCS34725 color sensor reading and absorbance calculation
 - Pump control with PWM for dosing and drain
 - LittleFS-hosted UI with real-time telemetry
+- Persisted settings and calibration ratios stored in ESP32 Preferences
 
 ## Hardware
 - ESP32
@@ -39,9 +40,15 @@ static const char *WIFI_PASS = "YOUR_PASSWORD";
 - Connect your browser to the ESP32 IP shown in serial logs.
 - Click "Start Cycle" to begin a measurement run.
 
+## API
+- `GET /api/config?baseFillSec=...&drainDuty=...` updates the runtime fill and drain settings and saves them to NVS.
+- `GET /api/calibrate?ph4Ratio=...&ph55Ratio=...&ph7Ratio=...` stores the three calibration ratios used by the pH mapping.
+- `GET /api/status` returns the current settings, calibration values, and live telemetry.
+
 ## Notes
-- Calibration constants are placeholders; adjust them for your buffers.
+- Calibration constants are placeholders until you measure your own buffers.
 - If the sensor is not detected at boot, the firmware retries in the background.
+- If the LittleFS UI is missing, `/` returns a 404 message that tells you to upload `data/index.html`.
 
 ## Troubleshooting
 - If the UI does not load, re-upload LittleFS.

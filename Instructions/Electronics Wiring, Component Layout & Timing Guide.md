@@ -35,7 +35,7 @@ Divide your enclosure into two distinct physical zones:
 | TCS34725 SCL | GPIO 22 | Yellow | I2C Clock Line |
 | Dual LEDs (Gate) | GPIO 2 | Red | Triggers the 2N2222 Transistor |
 | Pump 1 (Water) | GPIO 4 | Orange | Triggers MOSFET 1 Gate |
-| Pump 2 (Dye) | GPIO 5 | Purple | Triggers MOSFET 2 Gate (Supports PWM) |
+| Pump 2 (Dye) | GPIO 32 | Purple | Triggers MOSFET 2 Gate (Supports PWM) |
 | Pump 3 (Drain) | GPIO 18 | Blue | PWM Out (5 kHz, default 40% duty) |
 
 ### 2.2 The Power Distribution Network (Critical)
