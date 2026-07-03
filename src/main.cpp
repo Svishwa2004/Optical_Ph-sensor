@@ -11,6 +11,7 @@
 #include <Adafruit_SSD1306.h>
 #include <cmath>
 #include <math.h>
+#include <esp_task_wdt.h>
 
 // ----- Pinout -----
 static const uint8_t I2C_SDA = 21;
@@ -22,10 +23,12 @@ static const uint8_t PUMP3_PIN = 18;
 static const uint8_t BUTTON_PIN = 34; // START_BTN (input-only on ESP32)
 
 // ----- PWM (Pump 2) -----
-static const uint8_t PUMP2_PWM_CHANNEL = 0;
-static const uint16_t PUMP2_PWM_FREQ = 5000;
-static const uint8_t PUMP2_PWM_RES = 8;
-static const uint8_t PUMP2_DUTY = 89; // 35% of 255
+static const uint8_t  PUMP2_PWM_CHANNEL = 0;
+static const uint16_t PUMP2_PWM_FREQ    = 5000;
+static const uint8_t  PUMP2_PWM_RES     = 8;
+static const uint8_t  PUMP2_DUTY        = 89;  // 35% of 255 — steady operating duty
+static const uint8_t  PUMP2_KICK_DUTY   = 255; // 100% — kick-start torque burst
+static const uint32_t PUMP2_KICK_MS     = 250; // kick-start duration (ms)
 
 // ----- PWM (Drain Pump) -----
 static const uint8_t PUMP3_PWM_CHANNEL = 2;
@@ -50,6 +53,8 @@ static const uint32_t MEASURE_SAMPLE_MS = 1000;
 static const uint32_t DRAIN_MS = 3000;
 static const uint32_t COOL_DOWN_MS = 10000;
 static const uint32_t IDLE_MS = 3600000;
+static const uint8_t SENSOR_ZERO_RETRY_COUNT = 3;
+static const uint16_t SENSOR_ZERO_RETRY_DELAY_MS = 50;
 
 static const uint8_t SAMPLE_COUNT = 10;
 static const uint16_t SAMPLE_SPACING_MS = 100;
@@ -172,23 +177,32 @@ static void loadSettings() {
     return;
   }
 
-  uint32_t storedBaseFillMs = preferences.getUInt("baseFillMs", BASE_FILL_MS_DEFAULT);
+  uint32_t storedBaseFillMs = BASE_FILL_MS_DEFAULT;
+  if (preferences.isKey("baseFillMs")) {
+    storedBaseFillMs = preferences.getUInt("baseFillMs", BASE_FILL_MS_DEFAULT);
+  }
   uint16_t storedBaseFillSec = clampSeconds(static_cast<int>(storedBaseFillMs / 1000), BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
   baseFillMs = static_cast<uint32_t>(storedBaseFillSec) * 1000;
 
-  drainDutyPercent = clampPercent(preferences.getUChar("drainDuty", DRAIN_DUTY_DEFAULT_PERCENT));
+  if (preferences.isKey("drainDuty")) {
+    drainDutyPercent = clampPercent(preferences.getUChar("drainDuty", DRAIN_DUTY_DEFAULT_PERCENT));
+  } else {
+    drainDutyPercent = DRAIN_DUTY_DEFAULT_PERCENT;
+  }
   drainPwmDuty = percentToDuty(drainDutyPercent);
 
-  float storedPh4 = preferences.getFloat("calPh4", CAL_RATIO_PH4);
-  float storedPh55 = preferences.getFloat("calPh55", CAL_RATIO_PH55);
-  float storedPh7 = preferences.getFloat("calPh7", CAL_RATIO_PH7);
-  if (isfinite(storedPh4) && isfinite(storedPh55) && isfinite(storedPh7) &&
-      storedPh4 > storedPh55 && storedPh55 > storedPh7) {
-    CAL_RATIO_PH4 = storedPh4;
-    CAL_RATIO_PH55 = storedPh55;
-    CAL_RATIO_PH7 = storedPh7;
-  } else {
-    Serial.println("Calibration values invalid or missing; keeping defaults.");
+  if (preferences.isKey("calPh4") && preferences.isKey("calPh55") && preferences.isKey("calPh7")) {
+    float storedPh4 = preferences.getFloat("calPh4", CAL_RATIO_PH4);
+    float storedPh55 = preferences.getFloat("calPh55", CAL_RATIO_PH55);
+    float storedPh7 = preferences.getFloat("calPh7", CAL_RATIO_PH7);
+    if (std::isfinite(storedPh4) && std::isfinite(storedPh55) && std::isfinite(storedPh7) &&
+        storedPh4 > storedPh55 && storedPh55 > storedPh7) {
+      CAL_RATIO_PH4 = storedPh4;
+      CAL_RATIO_PH55 = storedPh55;
+      CAL_RATIO_PH7 = storedPh7;
+    } else {
+      Serial.println("Calibration values invalid; keeping defaults.");
+    }
   }
 }
 
@@ -212,7 +226,7 @@ static void setDrainDutyPercent(uint8_t percent, bool persist = true) {
 }
 
 static bool setCalibrationRatios(float ph4, float ph55, float ph7, bool persist = true) {
-  if (!isfinite(ph4) || !isfinite(ph55) || !isfinite(ph7)) {
+  if (!std::isfinite(ph4) || !std::isfinite(ph55) || !std::isfinite(ph7)) {
     return false;
   }
 
@@ -243,7 +257,15 @@ static void pump1On(bool on) {
 }
 
 static void pump2On(bool on) {
-    ledcWrite(PUMP2_PWM_CHANNEL, on ? PUMP2_DUTY : 0);
+    if (!on) {
+        ledcWrite(PUMP2_PWM_CHANNEL, 0);
+        return;
+    }
+    // Kick-start: drive full duty briefly to overcome static friction,
+    // then settle to steady operating duty.
+    ledcWrite(PUMP2_PWM_CHANNEL, PUMP2_KICK_DUTY);
+    delay(PUMP2_KICK_MS);
+    ledcWrite(PUMP2_PWM_CHANNEL, PUMP2_DUTY);
 }
 
 static void pump3On(bool on) {
@@ -259,8 +281,6 @@ static RawReading readAverageRaw(uint8_t samples, uint16_t spacingMs) {
   sensorReadError = false;
   if (samples == 0 || !sensorConnected || !sensorHealthy) return out;
 
-  Wire.setTimeOut(50);
-
   float sumR = 0.0f;
   float sumG = 0.0f;
   float sumB = 0.0f;
@@ -268,12 +288,23 @@ static RawReading readAverageRaw(uint8_t samples, uint16_t spacingMs) {
 
     for (uint8_t i = 0; i < samples; i++) {
         uint16_t r, g, b, c;
+      bool zeroReading = true;
+      for (uint8_t attempt = 0; attempt < SENSOR_ZERO_RETRY_COUNT; attempt++) {
         tcs.getRawData(&r, &g, &b, &c);
-    if (r == 0 && g == 0 && b == 0 && c == 0) {
+        if (!(r == 0 && g == 0 && b == 0 && c == 0)) {
+          zeroReading = false;
+          break;
+        }
+        if (attempt + 1 < SENSOR_ZERO_RETRY_COUNT) {
+          delay(SENSOR_ZERO_RETRY_DELAY_MS);
+        }
+      }
+
+    if (zeroReading) {
       sensorHealthy = false;
       sensorReadError = true;
       sensorConnected = false;
-      Serial.println("TCS34725 returned zeroed reading.");
+      Serial.printf("[%lu] TCS34725 returned zeroed reading after retries.\n", millis());
       return out;
     }
         sumR += r;
@@ -295,7 +326,7 @@ static float safeTransmittance(float test, float base) {
     float t = test / base;
     if (t < 0.0001f) t = 0.0001f;
   if (t > 1.0f) {
-    Serial.println("Warning: test exceeded baseline; clamping transmittance to 1.0.");
+    Serial.printf("[%lu] Warning: test exceeded baseline; clamping transmittance to 1.0.\n", millis());
     t = 1.0f;
   }
     return t;
@@ -360,11 +391,13 @@ static const char *getStateAction(ProcessState state) {
 static uint32_t getStateDuration(ProcessState state) {
     switch (state) {
     case ProcessState::BASE_FILL: return baseFillMs;
-        case ProcessState::BLANKING: return BLANKING_WARMUP_MS + BLANKING_SAMPLE_MS;
+        // Duration matches actual readAverageRaw() execution time so the
+        // progress bar stays in sync regardless of SAMPLE_COUNT / SAMPLE_SPACING_MS.
+        case ProcessState::BLANKING: return BLANKING_WARMUP_MS + (uint32_t)(SAMPLE_COUNT * SAMPLE_SPACING_MS);
         case ProcessState::MICRO_DOSE: return MICRO_DOSE_MS;
         case ProcessState::AGITATION: return AGITATION_MS;
         case ProcessState::DIFFUSION: return DIFFUSION_MS;
-        case ProcessState::MEASURE: return MEASURE_WARMUP_MS + MEASURE_SAMPLE_MS;
+        case ProcessState::MEASURE:  return MEASURE_WARMUP_MS  + (uint32_t)(SAMPLE_COUNT * SAMPLE_SPACING_MS);
         case ProcessState::DRAIN: return DRAIN_MS;
     case ProcessState::COOL_DOWN: return COOL_DOWN_MS;
         case ProcessState::IDLE: return IDLE_MS;
@@ -398,7 +431,7 @@ static String buildStatusJson() {
     doc["sensorHealthy"] = sensorHealthy;
     doc["sensorReadError"] = sensorReadError;
     doc["sensorConnected"] = sensorConnected;
-    doc["canStart"] = sensorConnected && currentState == ProcessState::IDLE;
+    doc["canStart"] = sensorConnected && sensorHealthy && currentState == ProcessState::IDLE;
 
     JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
     calibrationObj["ph4"] = CAL_RATIO_PH4;
@@ -474,17 +507,21 @@ static void setState(ProcessState next) {
     if (next == ProcessState::BASE_FILL) {
         pump1On(true);
     } else if (next == ProcessState::BLANKING) {
-        ledOn(true);
+        ledOn(true);         // LED on — begins thermal stabilisation
         baselineValid = false;
     } else if (next == ProcessState::MICRO_DOSE) {
         pump2On(true);
+        ledOn(true);         // Keep LED on — maintain thermal equilibrium
     } else if (next == ProcessState::AGITATION) {
         pump1On(true);
+        ledOn(true);         // Keep LED on — maintain thermal equilibrium
+    } else if (next == ProcessState::DIFFUSION) {
+        ledOn(true);         // Keep LED on — maintain thermal equilibrium
     } else if (next == ProcessState::MEASURE) {
-        ledOn(true);
+        ledOn(true);         // LED already stable — sample captured at same point as baseline
         sampleValid = false;
     } else if (next == ProcessState::DRAIN) {
-        pump3On(true);
+        pump3On(true);       // LED off via setAllOutputsOff() above — measurement done
     }
 
     broadcastStatus();
@@ -522,6 +559,13 @@ static void handleWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
     } else {
       sendStatusToClient(client);
     }
+  } else if (action && strcmp(action, "abort") == 0) {
+    // Abort mid-cycle: drain the flow cell and return to idle.
+    if (currentState != ProcessState::IDLE) {
+      Serial.printf("[%lu] Abort requested via WebSocket; draining.\n", millis());
+      setState(ProcessState::DRAIN);
+    }
+    sendStatusToClient(client);
   }
 }
 
@@ -619,12 +663,15 @@ static void runStateMachine() {
                 baseline = readAverageRaw(SAMPLE_COUNT, SAMPLE_SPACING_MS);
             if (sensorReadError) {
               baselineValid = false;
-              ledOn(false);
-              setState(ProcessState::IDLE);
+              ledOn(false);  // Error path — safe to kill LED
+              Serial.printf("[%lu] Dynamic blanking failed; draining before idle.\n", millis());
+              setState(ProcessState::DRAIN);
               break;
             }
                 baselineValid = true;
-                ledOn(false);
+                // LED intentionally kept ON — setState(MICRO_DOSE) will re-enable it
+                // so the LED stays thermally stable through to MEASURE.
+            Serial.printf("[%lu] Dynamic blanking complete; proceeding to micro-dose.\n", millis());
                 setState(ProcessState::MICRO_DOSE);
             }
             break;
@@ -656,7 +703,8 @@ static void runStateMachine() {
               lastAbs = {NAN, NAN, NAN};
               lastRatio = NAN;
               lastPh = NAN;
-              setState(ProcessState::IDLE);
+              Serial.printf("[%lu] Measurement failed; draining before idle.\n", millis());
+              setState(ProcessState::DRAIN);
               break;
             }
                 sampleValid = true;
@@ -694,11 +742,13 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    pinMode(LED_PIN, OUTPUT);
+    pinMode(LED_PIN,   OUTPUT);
     pinMode(PUMP1_PIN, OUTPUT);
-    pinMode(PUMP2_PIN, OUTPUT);
-    pinMode(PUMP3_PIN, OUTPUT);
-    setAllOutputsOff();
+    // PUMP2_PIN and PUMP3_PIN are PWM outputs via LEDC.
+    // ledcAttachPin() below reconfigures those GPIOs automatically,
+    // so an explicit pinMode(OUTPUT) call for them is not needed.
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(PUMP1_PIN, LOW);
 
     preferencesReady = preferences.begin("optph", false);
     if (!preferencesReady) {
@@ -715,7 +765,10 @@ void setup() {
     ledcAttachPin(PUMP3_PIN, PUMP3_PWM_CHANNEL);
     ledcWrite(PUMP3_PWM_CHANNEL, 0);
 
+    setAllOutputsOff();
+
     Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(100000);   // 100 kHz standard-mode — more tolerant of marginal wiring than default 400 kHz
     Wire.setTimeOut(50);
 
     // Button initialisation (external 10k pull-up expected)
@@ -780,24 +833,30 @@ void setup() {
 
     setupServer();
 
+    // Subscribe the Arduino loop task to the hardware Task Watchdog Timer.
+    // The watchdog is fed with esp_task_wdt_reset() each loop() iteration.
+    // Timeout is set by sdkconfig CONFIG_ESP_TASK_WDT_TIMEOUT_S (default 5 s).
+    esp_task_wdt_add(NULL);
+    Serial.printf("[%lu] System ready.\n", millis());
+
     setState(ProcessState::IDLE);
 }
 
 void loop() {
+    esp_task_wdt_reset();     // Feed the hardware watchdog each iteration
     ws.cleanupClients();
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiConnected) {
       wifiConnected = true;
-      Serial.print("WiFi connected. IP: ");
-      Serial.println(WiFi.localIP());
+      Serial.printf("[%lu] WiFi connected. IP: %s\n", millis(), WiFi.localIP().toString().c_str());
     }
   } else {
     wifiConnected = false;
     unsigned long now = millis();
     if (now - lastWifiAttemptMs >= WIFI_RETRY_MS) {
       lastWifiAttemptMs = now;
-      Serial.println("Retrying WiFi connection...");
+      Serial.printf("[%lu] Retrying WiFi connection...\n", millis());
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
@@ -809,13 +868,16 @@ void loop() {
             lastSensorCheckMs = now;
             if (tcs.begin()) {
                 sensorConnected = true;
-                sensorHealthy = true;
+                sensorHealthy   = true;
                 tcs.setInterrupt(true);
-                Serial.println("TCS34725 connected.");
-              setState(ProcessState::IDLE);
+                Serial.printf("[%lu] TCS34725 reconnected.\n", millis());
+                // Only broadcast/reset if already IDLE — do NOT interrupt a running cycle.
+                if (currentState == ProcessState::IDLE) {
+                    broadcastStatus();
+                }
             }
         }
-        delay(10);
+        // No blocking delay() here — the 2 s retry guard is sufficient throttling.
         return;
     }
 
@@ -847,13 +909,20 @@ void loop() {
       }
     }
 
-    // OLED update (lightweight)
+    // OLED update (lightweight, 500 ms cadence)
     if (oledPresent && (now - lastDisplayUpdateMs >= DISPLAY_UPDATE_INTERVAL_MS)) {
       lastDisplayUpdateMs = now;
       display.clearDisplay();
       display.setTextColor(SSD1306_WHITE);
+
+      // Row 0 (y=0) — current FSM state name
+      display.setTextSize(1);
       display.setCursor(0, 0);
+      display.print(getStateLabel(currentState));
+
+      // Row 1 (y=10) — pH reading
       display.setTextSize(2);
+      display.setCursor(0, 10);
       if (isnan(lastPh)) {
         display.print("pH: --");
       } else {
@@ -861,16 +930,22 @@ void loop() {
         display.print(lastPh, 2);
       }
 
+      // Row 2 (y=38) — RGB reading; shows '---' until a valid measurement exists
       display.setTextSize(1);
-      display.setCursor(0, 28);
-      uint8_t r8 = (sample.r >> 8) & 0xFF;
-      uint8_t g8 = (sample.g >> 8) & 0xFF;
-      uint8_t b8 = (sample.b >> 8) & 0xFF;
+      display.setCursor(0, 38);
       char rgbBuf[16];
-      sprintf(rgbBuf, "RGB:#%02X%02X%02X", r8, g8, b8);
+      if (sampleValid) {
+        uint8_t r8 = (sample.r >> 8) & 0xFF;
+        uint8_t g8 = (sample.g >> 8) & 0xFF;
+        uint8_t b8 = (sample.b >> 8) & 0xFF;
+        sprintf(rgbBuf, "RGB:#%02X%02X%02X", r8, g8, b8);
+      } else {
+        strcpy(rgbBuf, "RGB: ---");
+      }
       display.print(rgbBuf);
 
-      display.setCursor(0, 48);
+      // Row 3 (y=54) — WiFi status
+      display.setCursor(0, 54);
       display.print("W:");
       display.print(wifiConnected ? "OK" : "--");
 
