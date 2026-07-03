@@ -24,17 +24,17 @@ static const uint8_t BUTTON_PIN = 34; // START_BTN (input-only on ESP32)
 
 // ----- PWM (Pump 2) -----
 static const uint8_t  PUMP2_PWM_CHANNEL = 0;
-static const uint16_t PUMP2_PWM_FREQ    = 5000;
+static const uint16_t PUMP2_PWM_FREQ    = 25000; // 25 kHz — above audible range, eliminates motor coil whine
 static const uint8_t  PUMP2_PWM_RES     = 8;
-static const uint8_t  PUMP2_DUTY        = 89;  // 35% of 255 — steady operating duty
+static const uint8_t  PUMP2_DUTY        = 166; // 65% of 255 — steady operating duty (stepped up from 50% to stop mid-run stall)
 static const uint8_t  PUMP2_KICK_DUTY   = 255; // 100% — kick-start torque burst
 static const uint32_t PUMP2_KICK_MS     = 250; // kick-start duration (ms)
 
 // ----- PWM (Drain Pump) -----
 static const uint8_t PUMP3_PWM_CHANNEL = 2;
-static const uint16_t PUMP3_PWM_FREQ = 5000;
+static const uint16_t PUMP3_PWM_FREQ = 40000; // 40 kHz — higher freq for slower motor drivers that still whine at 25 kHz
 static const uint8_t PUMP3_PWM_RES = 8;
-static const uint8_t DRAIN_DUTY_DEFAULT_PERCENT = 40;
+static const uint8_t DRAIN_DUTY_DEFAULT_PERCENT = 100; // Full duty — no PWM switching noise; drain volume controlled by DRAIN_MS
 static uint8_t drainDutyPercent = DRAIN_DUTY_DEFAULT_PERCENT;
 static uint8_t drainPwmDuty = (DRAIN_DUTY_DEFAULT_PERCENT * 255 + 50) / 100;
 
@@ -45,7 +45,8 @@ static const uint16_t BASE_FILL_SEC_MAX = 120;
 static uint32_t baseFillMs = BASE_FILL_MS_DEFAULT;
 static const uint32_t BLANKING_WARMUP_MS = 2000;
 static const uint32_t BLANKING_SAMPLE_MS = 1000;
-static const uint32_t MICRO_DOSE_MS = 5500;
+// MICRO_DOSE_MS compensated for duty increase: 35% × 5500 ≈ 65% × 2960
+static const uint32_t MICRO_DOSE_MS = 2960;
 static const uint32_t AGITATION_MS = 1780;
 static const uint32_t DIFFUSION_MS = 15000;
 static const uint32_t MEASURE_WARMUP_MS = 1000;
@@ -510,8 +511,8 @@ static void setState(ProcessState next) {
         ledOn(true);         // LED on — begins thermal stabilisation
         baselineValid = false;
     } else if (next == ProcessState::MICRO_DOSE) {
+        ledOn(true);         // LED on first — pump2On() blocks 250 ms for kick-start, LED must be on before that
         pump2On(true);
-        ledOn(true);         // Keep LED on — maintain thermal equilibrium
     } else if (next == ProcessState::AGITATION) {
         pump1On(true);
         ledOn(true);         // Keep LED on — maintain thermal equilibrium
