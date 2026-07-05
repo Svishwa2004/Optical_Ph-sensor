@@ -7,8 +7,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include "Adafruit_TCS34725.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_I2C.h>          // HD44780 1602 via PCF8574 I2C backpack
 #include <cmath>
 #include <math.h>
 #include <esp_task_wdt.h>
@@ -32,11 +31,19 @@ static const uint32_t PUMP2_KICK_MS     = 250; // kick-start duration (ms)
 
 // ----- PWM (Drain Pump) -----
 static const uint8_t PUMP3_PWM_CHANNEL = 2;
-static const uint16_t PUMP3_PWM_FREQ = 40000; // 40 kHz — higher freq for slower motor drivers that still whine at 25 kHz
+static const uint16_t PUMP3_PWM_FREQ = 40000; // 40 kHz — above audible range, eliminates coil whine
 static const uint8_t PUMP3_PWM_RES = 8;
-static const uint8_t DRAIN_DUTY_DEFAULT_PERCENT = 100; // Full duty — no PWM switching noise; drain volume controlled by DRAIN_MS
+// 80% duty ≈ 8 V effective (at 10 V supply). Quieter than full speed; still
+// generates enough vacuum to fully empty the small flowcell within DRAIN_MS.
+// Raise toward 100 if the cell does not empty cleanly.
+static const uint8_t DRAIN_DUTY_DEFAULT_PERCENT = 80;
 static uint8_t drainDutyPercent = DRAIN_DUTY_DEFAULT_PERCENT;
 static uint8_t drainPwmDuty = (DRAIN_DUTY_DEFAULT_PERCENT * 255 + 50) / 100;
+// Soft-start ramp: step size (0-255 units) per tick and tick interval (ms).
+// Pump climbs from ~25% to target duty over ~300 ms, eliminating the
+// loud torque-impact clunk of a hard full-voltage start.
+static const uint8_t  PUMP3_RAMP_STEP_MS   = 20;   // ms between duty increments
+static const uint8_t  PUMP3_RAMP_START_PCT = 25;   // % duty at ramp start (enough to overcome static friction)
 
 // ----- Timing (ms) -----
 static const uint32_t BASE_FILL_MS_DEFAULT = 33000;
@@ -113,6 +120,8 @@ static unsigned long stateStartMs = 0;
 static unsigned long lastBroadcastMs = 0;
 static unsigned long lastSensorCheckMs = 0;
 static unsigned long lastWifiAttemptMs = 0;
+static unsigned long lastHeartbeatMs = 0;          // 5-second serial heartbeat
+static const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
 
 static bool sensorConnected = false;
 static bool sensorHealthy = true;
@@ -121,13 +130,19 @@ static bool baselineValid = false;
 static bool sampleValid = false;
 static bool wifiConnected = false;
 
-// OLED / display
-static const int SCREEN_WIDTH = 128;
-static const int SCREEN_HEIGHT = 64;
-static Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-static bool oledPresent = false;
+// LCD 1602 (HD44780 via PCF8574 I2C backpack)
+// PCF8574 ships in two address variants: 0x27 (A0-A2 = GND) or 0x3F (A0-A2 = VCC).
+// The I2C scan in setup() probes both and initialises whichever responds.
+static const uint8_t LCD_ADDR_A = 0x27;
+static const uint8_t LCD_ADDR_B = 0x3F;
+static LiquidCrystal_I2C lcd(LCD_ADDR_A, 16, 2); // address may be overridden in setup
+static bool lcdPresent = false;
 static unsigned long lastDisplayUpdateMs = 0;
 static const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 500;
+// Page cycling: page 0 = main (state/pH/ratio), page 1 = health (sensor/WiFi/duty)
+static uint8_t lcdPage = 0;
+static unsigned long lastPageFlipMs = 0;
+static const unsigned long PAGE_FLIP_INTERVAL_MS = 3000;
 
 // Button debounce
 static const unsigned long BUTTON_DEBOUNCE_MS = 50;
@@ -270,7 +285,26 @@ static void pump2On(bool on) {
 }
 
 static void pump3On(bool on) {
-  ledcWrite(PUMP3_PWM_CHANNEL, on ? drainPwmDuty : 0);
+  if (!on) {
+    ledcWrite(PUMP3_PWM_CHANNEL, 0);
+    return;
+  }
+  // Soft-start ramp: begin at PUMP3_RAMP_START_PCT and step up to drainPwmDuty.
+  // This eliminates the hard torque-impact clunk of a cold diaphragm pump start
+  // and significantly reduces perceived noise during the drain phase.
+  uint8_t startDuty = (PUMP3_RAMP_START_PCT * 255 + 50) / 100;
+  if (startDuty >= drainPwmDuty) {
+    // Target is already below or equal to start — no ramp needed.
+    ledcWrite(PUMP3_PWM_CHANNEL, drainPwmDuty);
+    return;
+  }
+  ledcWrite(PUMP3_PWM_CHANNEL, startDuty);
+  // Step from startDuty to drainPwmDuty in increments of ~10 duty counts.
+  for (uint8_t d = startDuty; d < drainPwmDuty; d += 10) {
+    ledcWrite(PUMP3_PWM_CHANNEL, d);
+    delay(PUMP3_RAMP_STEP_MS);
+  }
+  ledcWrite(PUMP3_PWM_CHANNEL, drainPwmDuty); // lock to final target
 }
 
 static void ledOn(bool on) {
@@ -665,14 +699,15 @@ static void runStateMachine() {
             if (sensorReadError) {
               baselineValid = false;
               ledOn(false);  // Error path — safe to kill LED
-              Serial.printf("[%lu] Dynamic blanking failed; draining before idle.\n", millis());
+              Serial.printf("[%lu] [BLANK] FAILED — sensor read error. Draining.\n", millis());
               setState(ProcessState::DRAIN);
               break;
             }
                 baselineValid = true;
                 // LED intentionally kept ON — setState(MICRO_DOSE) will re-enable it
                 // so the LED stays thermally stable through to MEASURE.
-            Serial.printf("[%lu] Dynamic blanking complete; proceeding to micro-dose.\n", millis());
+                Serial.printf("[%lu] [BLANK] OK  R=%-5u G=%-5u B=%-5u C=%-5u\n",
+                              millis(), baseline.r, baseline.g, baseline.b, baseline.c);
                 setState(ProcessState::MICRO_DOSE);
             }
             break;
@@ -704,17 +739,27 @@ static void runStateMachine() {
               lastAbs = {NAN, NAN, NAN};
               lastRatio = NAN;
               lastPh = NAN;
-              Serial.printf("[%lu] Measurement failed; draining before idle.\n", millis());
+              Serial.printf("[%lu] [MEAS]  FAILED — sensor read error. Draining.\n", millis());
               setState(ProcessState::DRAIN);
               break;
             }
                 sampleValid = true;
                 ledOn(false);
+                Serial.printf("[%lu] [MEAS]  Raw  R=%-5u G=%-5u B=%-5u C=%-5u\n",
+                              millis(), sample.r, sample.g, sample.b, sample.c);
 
             if (baselineValid) {
                     lastAbs = computeAbsorbance(baseline, sample);
                     lastRatio = computeRatio(lastAbs);
                     lastPh = mapRatioToPH(lastRatio);
+                    Serial.printf("[%lu] [MEAS]  Abs  R=%.4f G=%.4f B=%.4f\n",
+                                  millis(), lastAbs.r, lastAbs.g, lastAbs.b);
+                    if (isnan(lastRatio) || isnan(lastPh)) {
+                      Serial.printf("[%lu] [MEAS]  Ratio=NAN  pH=NAN (check calibration)\n", millis());
+                    } else {
+                      Serial.printf("[%lu] [MEAS]  Ratio=%.4f  pH=%.2f\n",
+                                    millis(), lastRatio, lastPh);
+                    }
                 }
 
                 setState(ProcessState::DRAIN);
@@ -775,44 +820,55 @@ void setup() {
     // Button initialisation (external 10k pull-up expected)
     pinMode(BUTTON_PIN, INPUT);
 
-    // I2C bus scan to detect OLED and other devices
-    Serial.println("Scanning I2C bus for devices...");
-    oledPresent = false;
+    // I2C bus scan — detect TCS34725 (0x29) and LCD backpack (0x27 or 0x3F)
+    Serial.println("[I2C]    Scanning bus...");
+    uint8_t lcdAddr = 0;
     for (uint8_t addr = 3; addr < 0x78; addr++) {
       Wire.beginTransmission(addr);
       if (Wire.endTransmission() == 0) {
-        Serial.printf("I2C device found at 0x%02X\n", addr);
-        if (addr == 0x3C) {
-          oledPresent = true;
+        Serial.printf("[I2C]    Device found at 0x%02X\n", addr);
+        if (addr == LCD_ADDR_A || addr == LCD_ADDR_B) {
+          lcdAddr = addr; // PCF8574 backpack for 1602 LCD
         }
       }
     }
 
-    if (oledPresent) {
-      if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        Serial.println("SSD1306 OLED init failed — continuing without display.");
-        oledPresent = false;
-      } else {
-        Serial.println("SSD1306 OLED initialized.");
-        display.clearDisplay();
-        display.display();
-        lastDisplayUpdateMs = millis();
-      }
+    if (lcdAddr != 0) {
+      lcd = LiquidCrystal_I2C(lcdAddr, 16, 2);
+      lcd.init();
+      lcd.backlight();
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("pH Sensor Boot  ");
+      lcd.setCursor(0, 1); lcd.print("Please wait...  ");
+      lcdPresent = true;
+      lastDisplayUpdateMs = millis();
+      lastPageFlipMs      = millis();
+      Serial.printf("[LCD]    1602 found at 0x%02X — initialized.\n", lcdAddr);
+    } else {
+      Serial.printf("[LCD]    1602 not found (checked 0x%02X and 0x%02X).\n",
+                    LCD_ADDR_A, LCD_ADDR_B);
     }
 
-    Serial.println("Optical pH Sensor booting...");
-    sensorConnected = tcs.begin();
+    // ---- Boot Banner ----
+    Serial.println();
+    Serial.println("============================================");
+    Serial.println("  Optical pH Sensor — Custom Build");
+    Serial.printf("  Compiled: %s %s\n", __DATE__, __TIME__);
+    Serial.println("============================================");
 
+    sensorConnected = tcs.begin();
     if (!sensorConnected) {
-        Serial.println("TCS34725 not found. Will retry.");
+        Serial.println("[SENSOR] TCS34725 NOT found — will retry every 2 s.");
     } else {
         tcs.setInterrupt(true);
-      sensorHealthy = true;
+        sensorHealthy = true;
+        Serial.println("[SENSOR] TCS34725 OK");
     }
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     lastWifiAttemptMs = millis();
+    Serial.printf("[WIFI]   Connecting to: %s\n", WIFI_SSID);
 
     unsigned long wifiStart = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < WIFI_CONNECT_TIMEOUT_MS) {
@@ -821,15 +877,17 @@ void setup() {
 
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnected = true;
-      Serial.print("WiFi connected. IP: ");
-      Serial.println(WiFi.localIP());
+      Serial.printf("[WIFI]   Connected. IP: %s  RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
     } else {
-      Serial.println("WiFi connect timeout. Will retry in background.");
+      Serial.println("[WIFI]   Timeout — will retry in background.");
     }
 
     fsReady = LittleFS.begin();
     if (!fsReady) {
-      Serial.println("LittleFS mount failed.");
+      Serial.println("[FS]     LittleFS mount failed.");
+    } else {
+      Serial.println("[FS]     LittleFS OK");
     }
 
     setupServer();
@@ -838,7 +896,17 @@ void setup() {
     // The watchdog is fed with esp_task_wdt_reset() each loop() iteration.
     // Timeout is set by sdkconfig CONFIG_ESP_TASK_WDT_TIMEOUT_S (default 5 s).
     esp_task_wdt_add(NULL);
-    Serial.printf("[%lu] System ready.\n", millis());
+
+    // ---- Configuration Summary ----
+    Serial.println("--------------------------------------------");
+    Serial.printf("[CFG]    Base fill:    %u s\n",  baseFillMs / 1000);
+    Serial.printf("[CFG]    Drain duty:   %u %%\n", drainDutyPercent);
+    Serial.printf("[CFG]    Cal pH4:      %.3f\n",  CAL_RATIO_PH4);
+    Serial.printf("[CFG]    Cal pH5.5:    %.3f\n",  CAL_RATIO_PH55);
+    Serial.printf("[CFG]    Cal pH7:      %.3f\n",  CAL_RATIO_PH7);
+    Serial.printf("[CFG]    LCD 1602:     %s\n",    lcdPresent ? "present" : "not found");
+    Serial.println("--------------------------------------------");
+    Serial.printf("[%lu] System ready. Waiting for START button or WebSocket 'start'.\n", millis());
 
     setState(ProcessState::IDLE);
 }
@@ -910,46 +978,125 @@ void loop() {
       }
     }
 
-    // OLED update (lightweight, 500 ms cadence)
-    if (oledPresent && (now - lastDisplayUpdateMs >= DISPLAY_UPDATE_INTERVAL_MS)) {
-      lastDisplayUpdateMs = now;
-      display.clearDisplay();
-      display.setTextColor(SSD1306_WHITE);
-
-      // Row 0 (y=0) — current FSM state name
-      display.setTextSize(1);
-      display.setCursor(0, 0);
-      display.print(getStateLabel(currentState));
-
-      // Row 1 (y=10) — pH reading
-      display.setTextSize(2);
-      display.setCursor(0, 10);
+    // ---- 5-second serial heartbeat ----
+    if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeatMs = now;
+      Serial.printf("[%lu] [HB] State=%-16s ", millis(), getStateLabel(currentState));
+      // Countdown remaining in current state
+      uint32_t dur = getStateDuration(currentState);
+      uint32_t elapsed = now - stateStartMs;
+      if (dur > 0 && elapsed < dur) {
+        Serial.printf("T-%lu s  ", (dur - elapsed) / 1000);
+      } else {
+        Serial.print("         ");
+      }
+      // pH
       if (isnan(lastPh)) {
-        display.print("pH: --");
+        Serial.print("pH=---  ");
       } else {
-        display.print("pH:");
-        display.print(lastPh, 2);
+        Serial.printf("pH=%.2f  ", lastPh);
+      }
+      // Ratio
+      if (isnan(lastRatio)) {
+        Serial.print("ratio=---  ");
+      } else {
+        Serial.printf("ratio=%.4f  ", lastRatio);
+      }
+      // Sensor + WiFi
+      Serial.printf("Sensor=%s  WiFi=%s",
+                    sensorConnected ? (sensorHealthy ? "OK" : "UNHEALTHY") : "DISCONN",
+                    wifiConnected   ? WiFi.localIP().toString().c_str() : "--");
+      Serial.println();
+    }
+
+    // ---- LCD 1602 update (500 ms cadence, 2-page layout) ----
+    // Page 0 — Main:   Row0=State+Timer  Row1=pH+Ratio
+    // Page 1 — Health: Row0=Sensor+Duty  Row1=WiFi IP
+    // Pages flip every PAGE_FLIP_INTERVAL_MS (3 s).
+    if (lcdPresent && (now - lastDisplayUpdateMs >= DISPLAY_UPDATE_INTERVAL_MS)) {
+      lastDisplayUpdateMs = now;
+
+      // Flip page on schedule
+      if (now - lastPageFlipMs >= PAGE_FLIP_INTERVAL_MS) {
+        lastPageFlipMs = now;
+        lcdPage = (lcdPage + 1) % 2;
+        lcd.clear(); // clear ghost chars when switching pages
       }
 
-      // Row 2 (y=38) — RGB reading; shows '---' until a valid measurement exists
-      display.setTextSize(1);
-      display.setCursor(0, 38);
-      char rgbBuf[16];
-      if (sampleValid) {
-        uint8_t r8 = (sample.r >> 8) & 0xFF;
-        uint8_t g8 = (sample.g >> 8) & 0xFF;
-        uint8_t b8 = (sample.b >> 8) & 0xFF;
-        sprintf(rgbBuf, "RGB:#%02X%02X%02X", r8, g8, b8);
+      // Helper lambda — writes exactly 16 chars to a row (pads/truncates)
+      // Defined inline to avoid polluting global namespace.
+      auto lcdRow = [](uint8_t row, const char *text) {
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%-16.16s", text);
+        lcd.setCursor(0, row);
+        lcd.print(buf);
+      };
+
+      if (lcdPage == 0) {
+        // ---- Page 0: Main ----
+
+        // Row 0: "<State 11chr>  <Timer 4chr>"
+        // e.g.  "Base Fill    33s"  or  "Idle            "
+        {
+          char row0[17];
+          const char *label = getStateLabel(currentState);
+          uint32_t dur     = getStateDuration(currentState);
+          uint32_t elapsed = now - stateStartMs;
+          char timerPart[6] = "     "; // 5 spaces default
+          if (dur > 0 && elapsed < dur) {
+            uint32_t remSec = (dur - elapsed + 500) / 1000;
+            snprintf(timerPart, sizeof(timerPart), "%4us", remSec);
+          }
+          snprintf(row0, sizeof(row0), "%-11.11s%5s", label, timerPart);
+          lcdRow(0, row0);
+        }
+
+        // Row 1: "pH:XX.XX R:X.XXX"
+        {
+          char row1[17];
+          char phPart[9];   // 8 chars
+          char ratPart[9];  // 8 chars
+          if (isnan(lastPh)) {
+            strcpy(phPart, "pH: --  ");
+          } else {
+            snprintf(phPart, sizeof(phPart), "pH:%5.2f", lastPh);
+          }
+          if (isnan(lastRatio)) {
+            strcpy(ratPart, "R: ---  ");
+          } else {
+            snprintf(ratPart, sizeof(ratPart), "R:%6.3f", lastRatio);
+          }
+          snprintf(row1, sizeof(row1), "%-8.8s%-8.8s", phPart, ratPart);
+          lcdRow(1, row1);
+        }
+
       } else {
-        strcpy(rgbBuf, "RGB: ---");
+        // ---- Page 1: Health ----
+
+        // Row 0: "SEN:OK   D: 80%"  or  "SEN:ERR  D: 80%"
+        {
+          char row0[17];
+          const char *senStr;
+          if (!sensorConnected)  senStr = "SEN:DISC";
+          else if (!sensorHealthy) senStr = "SEN:ERR ";
+          else                   senStr = "SEN:OK  ";
+          char dutyPart[9];
+          snprintf(dutyPart, sizeof(dutyPart), "D:%3u%%  ", drainDutyPercent);
+          snprintf(row0, sizeof(row0), "%-8.8s%-8.8s", senStr, dutyPart);
+          lcdRow(0, row0);
+        }
+
+        // Row 1: "W:192.168.1.42  "  or  "W:-- No WiFi    "
+        {
+          char row1[17];
+          if (wifiConnected) {
+            String ip = WiFi.localIP().toString();
+            snprintf(row1, sizeof(row1), "W:%-14.14s", ip.c_str());
+          } else {
+            strcpy(row1, "W:-- No WiFi    ");
+          }
+          lcdRow(1, row1);
+        }
       }
-      display.print(rgbBuf);
-
-      // Row 3 (y=54) — WiFi status
-      display.setCursor(0, 54);
-      display.print("W:");
-      display.print(wifiConnected ? "OK" : "--");
-
-      display.display();
     }
 }
