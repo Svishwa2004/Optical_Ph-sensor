@@ -25,7 +25,10 @@ static const uint8_t BUTTON_PIN = 34; // START_BTN (input-only on ESP32)
 static const uint8_t  PUMP2_PWM_CHANNEL = 0;
 static const uint16_t PUMP2_PWM_FREQ    = 25000; // 25 kHz — above audible range, eliminates motor coil whine
 static const uint8_t  PUMP2_PWM_RES     = 8;
-static const uint8_t  PUMP2_DUTY        = 166; // 65% of 255 — steady operating duty (stepped up from 50% to stop mid-run stall)
+// 35% duty electronically gear-reduces NKP native 37 mL/min to ~12.95 mL/min
+// (per project document Section 2.1: "electronically geared down to run incredibly slowly (~13 mL/min)")
+// 35% of 255 = 89 (raw duty count)
+static const uint8_t  PUMP2_DUTY        = 89;  // 35% of 255
 static const uint8_t  PUMP2_KICK_DUTY   = 255; // 100% — kick-start torque burst
 static const uint32_t PUMP2_KICK_MS     = 250; // kick-start duration (ms)
 
@@ -52,8 +55,38 @@ static const uint16_t BASE_FILL_SEC_MAX = 120;
 static uint32_t baseFillMs = BASE_FILL_MS_DEFAULT;
 static const uint32_t BLANKING_WARMUP_MS = 2000;
 static const uint32_t BLANKING_SAMPLE_MS = 1000;
-// MICRO_DOSE_MS compensated for duty increase: 35% × 5500 ≈ 65% × 2960
-static const uint32_t MICRO_DOSE_MS = 2960;
+// ----- MICRO_DOSE_MS Derivation (from physical tubing geometry) -----
+// Target delivery:       1.19 mL into the flowcell (per project doc Section 3)
+//
+// Tubing dimensions:     3 mm ID / 5 mm OD silicone
+//   Total tube length:   175 mm
+//   Exposed length:      49.5 mm (outside pump head = dead volume)
+//   In-pump length:      175 - 49.5 = 125.5 mm (the peristaltic compression zone)
+//
+// Dead volume (exposed section, fluid that must be pushed through first):
+//   V_dead = pi * r^2 * L = pi * 1.5^2 * 49.5 = 350 mm^3 = 0.350 mL
+//
+// Total volume pump must displace:
+//   V_total = 1.19 + 0.350 = 1.540 mL
+//
+// Flow rates:
+//   At 100% duty (kick): 37 mL/min = 0.6167 mL/s
+//   At  35% duty (steady): 37 * 0.35 = 12.95 mL/min = 0.2158 mL/s
+//
+// Volume delivered during 250 ms kick at 100%:
+//   V_kick = 0.6167 * 0.250 = 0.154 mL
+//
+// Remaining volume after kick:
+//   V_steady = 1.540 - 0.154 = 1.386 mL
+//
+// Time at steady 35% duty:
+//   t_steady = 1.386 / 0.2158 = 6.423 s = 6423 ms
+//
+// Total MICRO_DOSE_MS = PUMP2_KICK_MS + t_steady = 250 + 6423 = 6673 ms
+// Rounded to nearest 50 ms = 6650 ms
+//
+// Re-calibrate if: tubing is replaced, PUMP2_DUTY changes, or pump is swapped.
+static const uint32_t MICRO_DOSE_MS = 6650;
 static const uint32_t AGITATION_MS = 1780;
 static const uint32_t DIFFUSION_MS = 15000;
 static const uint32_t MEASURE_WARMUP_MS = 1000;
