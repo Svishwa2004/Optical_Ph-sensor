@@ -242,6 +242,16 @@ header {
 .config-hint.error {
   color: #b54a3b;
 }
+.primewarn {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #a4632a;
+  background: rgba(242, 162, 58, 0.12);
+  border: 1px solid rgba(242, 162, 58, 0.45);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
 .cta {
   appearance: none;
   border: 0;
@@ -345,17 +355,27 @@ header {
         <button id="startBtn" class="cta" disabled>Start Cycle</button>
         <div id="startHint" class="hint">Connecting to device...</div>
       </div>
+      <div id="primeWarn" class="primewarn" hidden>
+        Dye line not primed since boot. Prime it before trusting a reading, or
+        the first dose only fills the 0.71 mL outlet.
+      </div>
       <div class="config-row">
-        <label class="config-label" for="baseFillInput">Base Fill (s)</label>
-        <input id="baseFillInput" class="config-input" type="number" min="5" max="120" step="1" value="33"/>
+        <label class="config-label" for="baseFillInput">Base Fill (ms)</label>
+        <input id="baseFillInput" class="config-input" type="number" min="5000" max="120000" step="100" value="25378"/>
         <button id="baseFillApply" class="config-button" type="button">Apply</button>
         <div id="baseFillHint" class="config-hint">--</div>
       </div>
       <div class="config-row">
         <label class="config-label" for="doseInput">Dye Dose (ms)</label>
-        <input id="doseInput" class="config-input" type="number" min="200" max="8000" step="50" value="2700"/>
+        <input id="doseInput" class="config-input" type="number" min="200" max="8000" step="50" value="1111"/>
         <button id="doseApply" class="config-button" type="button">Apply</button>
         <div id="doseHint" class="config-hint">--</div>
+      </div>
+      <div class="config-row">
+        <label class="config-label">Prime Line</label>
+        <button id="primeDyeBtn" class="config-button" type="button">Dye</button>
+        <button id="primeWaterBtn" class="config-button" type="button">Water</button>
+        <div id="primeHint" class="config-hint">Run with the cell empty, then drain.</div>
       </div>
 
       <div class="calpanel">
@@ -471,6 +491,10 @@ const baseFillHint = document.getElementById("baseFillHint");
 const doseInput = document.getElementById("doseInput");
 const doseApply = document.getElementById("doseApply");
 const doseHint = document.getElementById("doseHint");
+const primeDyeBtn = document.getElementById("primeDyeBtn");
+const primeWaterBtn = document.getElementById("primeWaterBtn");
+const primeHint = document.getElementById("primeHint");
+const primeWarn = document.getElementById("primeWarn");
 const calCapturePh = document.getElementById("calCapturePh");
 const calCaptureBtn = document.getElementById("calCaptureBtn");
 const calCaptureHint = document.getElementById("calCaptureHint");
@@ -537,10 +561,19 @@ function setDoseHint(text, isError) {
 }
 
 function updateBaseFillUI(d) {
-  if (!d || typeof d.baseFillSec !== "number") return;
-  const sec = Math.round(d.baseFillSec);
+  if (!d || typeof d.baseFillMs !== "number") return;
   if (document.activeElement !== baseFillInput) {
-    baseFillInput.value = sec;
+    baseFillInput.value = Math.round(d.baseFillMs);
+  }
+  const f = d.fluidics;
+  if (f && typeof f.baseFillMl === "number" && typeof f.cellOperatingMl === "number") {
+    const total = f.baseFillMl + (f.dyeTargetMl || 0) + (f.agitationMl || 0);
+    const over = total > f.cellOperatingMl;
+    setBaseFillHint(
+      `${f.baseFillMl.toFixed(2)} mL, cell ${total.toFixed(2)}/${f.cellOperatingMl.toFixed(2)} mL` +
+        (over ? " - OVERFILL" : ""),
+      over
+    );
   }
 }
 
@@ -549,7 +582,40 @@ function updateDoseUI(d) {
   if (document.activeElement !== doseInput) {
     doseInput.value = Math.round(d.doseMs);
   }
-  document.getElementById("doseValue").textContent = `${Math.round(d.doseMs)} ms`;
+  const f = d.fluidics;
+  const ml = f && typeof f.dyeTargetMl === "number" ? ` (~${f.dyeTargetMl.toFixed(2)} mL)` : "";
+  document.getElementById("doseValue").textContent = `${Math.round(d.doseMs)} ms${ml}`;
+}
+
+// The dye line empties between runs, so an unprimed first dose is swallowed by
+// the outlet dead volume. Surface that rather than letting it read as a bad pH.
+function updatePrimeUI(d) {
+  if (!d) return;
+  const primed = d.dyeLinePrimed === true;
+  primeWarn.hidden = primed;
+  const busy = d.state !== "Idle" && d.stateId !== 0;
+  primeDyeBtn.disabled = busy;
+  primeWaterBtn.disabled = busy;
+}
+
+function runPrime(pump) {
+  primeHint.textContent = `Priming ${pump}...`;
+  primeHint.classList.remove("error");
+  fetch(`/api/prime?pump=${encodeURIComponent(pump)}`)
+    .then((res) => {
+      if (res.status === 409) throw new Error("Device busy - wait for idle");
+      if (!res.ok) throw new Error("Request failed");
+      return res.json();
+    })
+    .then((payload) => {
+      const ms = payload && typeof payload.primeMs === "number" ? payload.primeMs : 0;
+      const ml = payload && typeof payload.lineMl === "number" ? payload.lineMl.toFixed(2) : "?";
+      primeHint.textContent = `Priming ${pump} for ${ms} ms (${ml} mL line)`;
+    })
+    .catch((err) => {
+      primeHint.textContent = err.message || "Prime failed";
+      primeHint.classList.add("error");
+    });
 }
 
 function updateCalibrationUI(d) {
@@ -588,18 +654,21 @@ function updateCalibrationUI(d) {
   }
 }
 
+// Sends baseFillMs, not baseFillSec: the derived default is 25378 ms, and
+// rounding that to whole seconds would drop 0.23 mL from the cell every time
+// someone touched Apply.
 function applyBaseFill() {
   const rawValue = parseInt(baseFillInput.value, 10);
   if (!Number.isFinite(rawValue)) {
     setBaseFillHint("Enter a number", true);
     return;
   }
-  const clamped = Math.min(120, Math.max(5, rawValue));
+  const clamped = Math.min(120000, Math.max(5000, rawValue));
   if (clamped !== rawValue) {
     baseFillInput.value = clamped;
   }
   setBaseFillHint("Applying...", false);
-  fetch(`/api/config?baseFillSec=${clamped}`)
+  fetch(`/api/config?baseFillMs=${clamped}`)
     .then((res) => {
       if (!res.ok) {
         throw new Error("Request failed");
@@ -607,10 +676,11 @@ function applyBaseFill() {
       return res.json();
     })
     .then((payload) => {
-      if (payload && typeof payload.baseFillSec === "number") {
-        const sec = Math.round(payload.baseFillSec);
-        baseFillInput.value = sec;
-        setBaseFillHint(`Saved ${sec} s`, false);
+      if (payload && typeof payload.baseFillMs === "number") {
+        const ms = Math.round(payload.baseFillMs);
+        baseFillInput.value = ms;
+        const ml = (ms * 0.6167) / 1000;
+        setBaseFillHint(`Saved ${ms} ms (~${ml.toFixed(2)} mL)`, false);
       } else {
         setBaseFillHint("Saved", false);
       }
@@ -738,6 +808,7 @@ function updateUI(d) {
 
   updateBaseFillUI(d);
   updateDoseUI(d);
+  updatePrimeUI(d);
   updateCalibrationUI(d);
 
   const progress = Math.min(1, Math.max(0, d.progress || 0));
@@ -801,6 +872,9 @@ doseApply.addEventListener("click", applyDose);
 doseInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") applyDose();
 });
+
+primeDyeBtn.addEventListener("click", () => runPrime("dye"));
+primeWaterBtn.addEventListener("click", () => runPrime("water"));
 
 calPointsApply.addEventListener("click", applyCalibrationPoints);
 calPointsInput.addEventListener("keydown", (event) => {

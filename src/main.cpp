@@ -48,63 +48,131 @@ static uint8_t drainPwmDuty = (DRAIN_DUTY_DEFAULT_PERCENT * 255 + 50) / 100;
 static const uint8_t  PUMP3_RAMP_STEP_MS   = 20;   // ms between duty increments
 static const uint8_t  PUMP3_RAMP_START_PCT = 25;   // % duty at ramp start (enough to overcome static friction)
 
+// ============================ FLUIDIC GEOMETRY ==============================
+// Every wetted line is food-grade silicone, 3 mm ID / 5 mm OD (project doc 2.2).
+// Cross-section A = pi * (1.5 mm)^2 = 7.0686 mm^2, so 1 cm of tube holds
+// 0.070686 mL. Measured lengths (2026-08-08):
+//
+//   Pump              inlet (source -> pump)   outlet (pump -> destination)
+//   1 water fill      39 cm = 2.757 mL         12 cm = 0.848 mL
+//   2 dye dose         8 cm = 0.565 mL         10 cm = 0.707 mL
+//   3 vacuum drain    12 cm = 0.848 mL         46 cm = 3.252 mL
+//
+// Re-cut a tube? Update the *_CM figure below and every dependent duration
+// re-derives itself. Nothing downstream is hand-tuned.
+static constexpr float TUBE_ML_PER_CM = 0.070686f; // 3 mm ID silicone
+
+static constexpr float P1_INLET_CM  = 39.0f;
+static constexpr float P1_OUTLET_CM = 12.0f;
+static constexpr float P2_INLET_CM  = 8.0f;
+static constexpr float P2_OUTLET_CM = 10.0f;
+static constexpr float P3_INLET_CM  = 12.0f;
+static constexpr float P3_OUTLET_CM = 46.0f;
+
+static constexpr float lineMl(float cm) { return cm * TUBE_ML_PER_CM; }
+
+static constexpr float P1_LINE_ML = lineMl(P1_INLET_CM + P1_OUTLET_CM); // 3.605
+static constexpr float P2_LINE_ML = lineMl(P2_INLET_CM + P2_OUTLET_CM); // 1.272
+static constexpr float P3_LINE_ML = lineMl(P3_INLET_CM + P3_OUTLET_CM); // 4.100
+
+// Nominal NKP-DC-S06B throughput, both peristaltic heads: 37 mL/min at 100%.
+static constexpr float PUMP_ML_PER_S = 37.0f / 60.0f;          // 0.6167 mL/s
+// Pump 2 is electronically geared to 35% duty for metering resolution.
+static constexpr float PUMP2_ML_PER_S = PUMP_ML_PER_S * 0.35f; // 0.2158 mL/s
+
+// ----- Volume budget (project doc Section 3) -----
+// Cell holds 21.36 mL absolute; operation is capped at 80% = 17.09 mL so the
+// dye injection port stays above the liquid line and turbulence has headspace.
+static constexpr float CELL_OPERATING_ML = 17.09f;
+static constexpr float DYE_DOSE_ML       = 0.34f;  // 2.0% v/v per indicator spec
+static constexpr float AGITATION_ML      = 1.10f;  // mixing jet, fires after dosing
+static constexpr float BASE_FILL_ML =
+    CELL_OPERATING_ML - DYE_DOSE_ML - AGITATION_ML; // 15.65 mL
+
+// Volume delivered by pump 2's full-duty kick-start burst (PUMP2_KICK_MS).
+static constexpr float PUMP2_KICK_ML = PUMP_ML_PER_S * (PUMP2_KICK_MS / 1000.0f);
+
+// Time for pump 1 (plain 100% duty, no kick) to move a given volume.
+static constexpr uint32_t pump1Ms(float ml) {
+    return (uint32_t)((ml / PUMP_ML_PER_S) * 1000.0f + 0.5f);
+}
+// Time for pump 2 to move a given volume: 250 ms at full duty, remainder at 35%.
+static constexpr uint32_t pump2Ms(float ml) {
+    return (ml <= PUMP2_KICK_ML)
+               ? (uint32_t)((ml / PUMP2_KICK_ML) * (float)PUMP2_KICK_MS + 0.5f)
+               : (uint32_t)((float)PUMP2_KICK_MS +
+                            ((ml - PUMP2_KICK_ML) / PUMP2_ML_PER_S) * 1000.0f +
+                            0.5f);
+}
+
 // ----- Timing (ms) -----
-static const uint32_t BASE_FILL_MS_DEFAULT = 33000;
+// 15.65 mL at 0.6167 mL/s = 25378 ms. Assumes the pump-1 line is already full:
+// the peristaltic rollers pinch the tube shut when unpowered, so the 39 cm
+// inlet holds its column between runs. Run /api/prime?pump=water once after a
+// tube change or reservoir swap. The previous 33000 ms was never bench-verified
+// and delivers 20.35 mL — past the 17.09 mL operating cap before dye or
+// agitation water is added.
+static const uint32_t BASE_FILL_MS_DEFAULT = pump1Ms(BASE_FILL_ML);
+static const uint32_t BASE_FILL_MS_MIN = 5000;
+static const uint32_t BASE_FILL_MS_MAX = 120000;
+// Stale NVS values from the pre-geometry firmware, discarded on load.
+static const uint32_t LEGACY_BASE_FILL_MS = 33000;
+static const uint32_t LEGACY_DOSE_MS = 2700;
 static const uint16_t BASE_FILL_SEC_MIN = 5;
 static const uint16_t BASE_FILL_SEC_MAX = 120;
 static uint32_t baseFillMs = BASE_FILL_MS_DEFAULT;
 static const uint32_t BLANKING_WARMUP_MS = 2000;
 static const uint32_t BLANKING_SAMPLE_MS = 1000;
-// ----- doseMs Derivation (from physical tubing geometry) -----
-// Target delivery:       0.34 mL into the flowcell.
+// ----- doseMs Derivation -----
+// Target delivery: 0.34 mL (2.0% v/v of the 17.09 mL operating volume, per the
+// Techno Pharmchem universal indicator spec of 0.2 mL per 10 mL of sample).
+// The previous 1.19 mL = 6.98% v/v was tuned for the old 0.04% BTB/MR custom
+// dye; the universal indicator carries ~0.084% total dyes, so the old volume
+// over-saturates the cell and crushes hue resolution at the pH extremes.
 //
-//   Techno Pharmchem universal indicator (pH 1-14) spec is 0.2 mL per 10 mL
-//   of sample = 2.0% v/v. Operating cell volume is 17.09 mL (project doc
-//   Section 3), so 2% = 0.342 mL. (The previous 1.19 mL = 6.98% v/v was tuned
-//   for the old 0.04% BTB/MR custom dye; the universal indicator carries
-//   ~0.084% total dyes, ~2x more concentrated per mL, so the old volume would
-//   over-saturate the cell and crush hue resolution at the pH extremes.)
+// The dose time depends entirely on whether the dye line is already full:
 //
-// Tubing dimensions:     3 mm ID / 5 mm OD silicone
-//   Total tube length:   175 mm
-//   Exposed length:      49.5 mm (outside pump head = dead volume)
-//   In-pump length:      175 - 49.5 = 125.5 mm (the peristaltic compression zone)
+//   line primed (dead 0.000 mL) ->  1111 ms   <-- the default, see below
+//   outlet drained (0.707 mL)   ->  4386 ms
+//   whole line empty (1.272 mL) ->  7006 ms
 //
-// Dead volume (exposed section, fluid that must be pushed through first):
-//   V_dead = pi * r^2 * L = pi * 1.5^2 * 49.5 = 350 mm^3 = 0.350 mL
+// That spread is why priming is not optional. The 10 cm outlet holds 0.707 mL,
+// which is 2.1x the dose itself, so if an unknown fraction of it drains between
+// cycles the dose error can exceed 100%. Run /api/prime?pump=dye to fill the
+// line to a known-wet state; MICRO_DOSE then moves pure volume and doseMs is
+// simply the time to push 0.34 mL. dyeLinePrimed is false at every boot and the
+// dashboard warns until you prime.
 //
-// Total volume pump must displace:
-//   V_total = 0.34 + 0.350 = 0.690 mL
-//
-// Flow rates:
-//   At 100% duty (kick): 37 mL/min = 0.6167 mL/s
-//   At  35% duty (steady): 37 * 0.35 = 12.95 mL/min = 0.2158 mL/s
-//
-// Volume delivered during 250 ms kick at 100%:
-//   V_kick = 0.6167 * 0.250 = 0.154 mL
-//
-// Remaining volume after kick:
-//   V_steady = 0.690 - 0.154 = 0.536 mL
-//
-// Time at steady 35% duty:
-//   t_steady = 0.536 / 0.2158 = 2.484 s = 2484 ms
-//
-// Default doseMs = PUMP2_KICK_MS + t_steady = 250 + 2484 = 2734 ms
-// Rounded to nearest 50 ms = 2700 ms
-//
-// ** BENCH-VERIFY THIS. ** The dead-volume term assumes the dye line is EMPTY
-// at the start of each dose (0.35 mL re-primed every cycle). If the line stays
-// primed between runs, the true figure is closer to ~1100 ms. Dose into a
-// graduated container and trim doseMs at runtime via /api/config?doseMs=...
-// until 0.34 mL is delivered. Also re-tune if tubing/PUMP2_DUTY/pump changes.
-static const uint32_t DOSE_MS_DEFAULT = 2700;
+// ** STILL BENCH-VERIFY. ** Dose into a graduated container and trim at runtime
+// via /api/config?doseMs=... until 0.34 mL lands. Re-tune if the tubing,
+// PUMP2_DUTY, or the pump itself changes.
+static const uint32_t DOSE_MS_DEFAULT = pump2Ms(DYE_DOSE_ML);
 static const uint32_t DOSE_MS_MIN = 200;
 static const uint32_t DOSE_MS_MAX = 8000;
 static uint32_t doseMs = DOSE_MS_DEFAULT;
-static const uint32_t AGITATION_MS = 1780;
+
+// ----- Prime -----
+// Fills a pump's line from source to outlet so dead volume stops being a guess.
+// 15% overshoot pushes a little fluid past the outlet, guaranteeing the tube is
+// wet end-to-end rather than stopping with an air gap at the tip. Prime with the
+// cell empty and drain afterwards — the overshoot lands in the chamber.
+static constexpr float PRIME_OVERSHOOT = 1.15f;
+static const uint32_t PRIME_DYE_MS_DEFAULT   = pump2Ms(P2_LINE_ML * PRIME_OVERSHOOT);
+static const uint32_t PRIME_WATER_MS_DEFAULT = pump1Ms(P1_LINE_ML * PRIME_OVERSHOOT);
+static const uint32_t PRIME_MS_MIN = 200;
+static const uint32_t PRIME_MS_MAX = 20000;
+static uint32_t primeMs = PRIME_DYE_MS_DEFAULT;  // duration of the active prime
+static bool primeUsesDyePump = true;             // which pump the prime drives
+static bool dyeLinePrimed = false;               // cleared on every boot
+
+// 1.10 mL at 0.6167 mL/s. No dead-volume term: the pump-1 line is already full
+// from BASE_FILL, so this is pure delivered volume.
+static const uint32_t AGITATION_MS = pump1Ms(AGITATION_ML);
 static const uint32_t DIFFUSION_MS = 15000;
 static const uint32_t MEASURE_WARMUP_MS = 1000;
 static const uint32_t MEASURE_SAMPLE_MS = 1000;
+// R385 at ~13.3 mL/s clears the 17.09 mL cell plus the 4.10 mL drain path in
+// ~1.6 s; the balance is air purge that strips residual droplets off the floor.
 static const uint32_t DRAIN_MS = 6000;
 static const uint32_t COOL_DOWN_MS = 10000;
 static const uint32_t IDLE_MS = 3600000;
@@ -179,7 +247,8 @@ enum class ProcessState : uint8_t {
     DIFFUSION = 5,
     MEASURE = 6,
   DRAIN = 7,
-  COOL_DOWN = 8
+  COOL_DOWN = 8,
+  PRIME = 9
 };
 
 struct RawReading {
@@ -301,8 +370,16 @@ static void loadSettings() {
   if (preferences.isKey("baseFillMs")) {
     storedBaseFillMs = preferences.getUInt("baseFillMs", BASE_FILL_MS_DEFAULT);
   }
-  uint16_t storedBaseFillSec = clampSeconds(static_cast<int>(storedBaseFillMs / 1000), BASE_FILL_SEC_MIN, BASE_FILL_SEC_MAX);
-  baseFillMs = static_cast<uint32_t>(storedBaseFillSec) * 1000;
+  // Migration: 33000 ms was the old never-verified default and overfills the
+  // cell (20.35 mL vs the 17.09 mL cap). Discard it so units already in the
+  // field pick up the geometry-derived value instead of inheriting the bug.
+  if (storedBaseFillMs == LEGACY_BASE_FILL_MS) {
+    Serial.println("Discarding legacy 33000 ms base fill (overfills cell); using derived default.");
+    storedBaseFillMs = BASE_FILL_MS_DEFAULT;
+  }
+  if (storedBaseFillMs < BASE_FILL_MS_MIN) storedBaseFillMs = BASE_FILL_MS_MIN;
+  if (storedBaseFillMs > BASE_FILL_MS_MAX) storedBaseFillMs = BASE_FILL_MS_MAX;
+  baseFillMs = storedBaseFillMs;
 
   if (preferences.isKey("drainDuty")) {
     drainDutyPercent = clampPercent(preferences.getUChar("drainDuty", DRAIN_DUTY_DEFAULT_PERCENT));
@@ -313,6 +390,13 @@ static void loadSettings() {
 
   if (preferences.isKey("doseMs")) {
     uint32_t storedDose = preferences.getUInt("doseMs", DOSE_MS_DEFAULT);
+    // Migration: 2700 ms came from an assumed 49.5 mm dead-volume segment. The
+    // measured outlet is 10 cm, so that figure is either a 2x overdose (primed
+    // line) or delivers nothing at all (drained line). Neither is usable.
+    if (storedDose == LEGACY_DOSE_MS) {
+      Serial.println("Discarding legacy 2700 ms dose (wrong dead-volume assumption); using derived default.");
+      storedDose = DOSE_MS_DEFAULT;
+    }
     if (storedDose < DOSE_MS_MIN) storedDose = DOSE_MS_MIN;
     if (storedDose > DOSE_MS_MAX) storedDose = DOSE_MS_MAX;
     doseMs = storedDose;
@@ -352,6 +436,19 @@ static void setBaseFillSeconds(int seconds, bool persist = true) {
   if (persist) {
     saveSettings();
   }
+}
+
+// Millisecond-resolution base fill. Whole-second steps move 0.617 mL each,
+// which is 3.6% of the cell — too coarse to land on the 15.65 mL target, so the
+// fill is stored in ms. setBaseFillSeconds() stays for API back-compat.
+static uint32_t setBaseFillMs(uint32_t requested, bool persist = true) {
+  if (requested < BASE_FILL_MS_MIN) requested = BASE_FILL_MS_MIN;
+  if (requested > BASE_FILL_MS_MAX) requested = BASE_FILL_MS_MAX;
+  baseFillMs = requested;
+  if (persist) {
+    saveSettings();
+  }
+  return baseFillMs;
 }
 
 static void setDrainDutyPercent(uint8_t percent, bool persist = true) {
@@ -410,6 +507,13 @@ static void pump2On(bool on) {
     ledcWrite(PUMP2_PWM_CHANNEL, PUMP2_KICK_DUTY);
     delay(PUMP2_KICK_MS);
     ledcWrite(PUMP2_PWM_CHANNEL, PUMP2_DUTY);
+}
+
+// Pump 2 at 100% duty. Used only for priming, where throughput matters and
+// metering precision does not — pump2On()'s 35% gear-down would make filling
+// the 1.27 mL line needlessly slow.
+static void pump2Full(bool on) {
+    ledcWrite(PUMP2_PWM_CHANNEL, on ? PUMP2_KICK_DUTY : 0);
 }
 
 static void pump3On(bool on) {
@@ -600,6 +704,7 @@ static const char *getStateLabel(ProcessState state) {
         case ProcessState::MEASURE: return "Measurement";
         case ProcessState::DRAIN: return "Vacuum Drain";
     case ProcessState::COOL_DOWN: return "Cool Down";
+    case ProcessState::PRIME: return "Line Prime";
         default: return "Idle";
     }
 }
@@ -614,6 +719,7 @@ static const char *getStateAction(ProcessState state) {
         case ProcessState::MEASURE: return "Reading optical color";
         case ProcessState::DRAIN: return "Evacuating chamber";
     case ProcessState::COOL_DOWN: return "Cooling pump";
+    case ProcessState::PRIME: return "Filling supply line";
         default: return "Idle wait";
     }
 }
@@ -630,6 +736,7 @@ static uint32_t getStateDuration(ProcessState state) {
         case ProcessState::MEASURE:  return MEASURE_WARMUP_MS  + (uint32_t)(SAMPLE_COUNT * SAMPLE_SPACING_MS);
         case ProcessState::DRAIN: return DRAIN_MS;
     case ProcessState::COOL_DOWN: return COOL_DOWN_MS;
+    case ProcessState::PRIME: return primeMs;
         case ProcessState::IDLE: return IDLE_MS;
         default: return 0;
     }
@@ -655,6 +762,19 @@ static String buildStatusJson() {
     doc["baseFillMs"] = baseFillMs;
     doc["baseFillSec"] = baseFillMs / 1000;
     doc["doseMs"] = doseMs;
+    doc["dyeLinePrimed"] = dyeLinePrimed;
+
+    // Fluidics: derived volumes so the dashboard can show what the current
+    // timings actually deliver instead of restating the raw milliseconds.
+    JsonObject fluid = doc["fluidics"].to<JsonObject>();
+    fluid["baseFillMl"] = baseFillMs * PUMP_ML_PER_S / 1000.0f;
+    fluid["agitationMl"] = AGITATION_ML;
+    fluid["cellOperatingMl"] = CELL_OPERATING_ML;
+    fluid["dyeTargetMl"] = DYE_DOSE_ML;
+    fluid["dyeLineMl"] = P2_LINE_ML;
+    fluid["primeDyeMs"] = PRIME_DYE_MS_DEFAULT;
+    fluid["primeWaterMs"] = PRIME_WATER_MS_DEFAULT;
+
     doc["baselineValid"] = baselineValid;
     doc["sampleValid"] = sampleValid;
     doc["drainDutyPercent"] = drainDutyPercent;
@@ -768,9 +888,30 @@ static void setState(ProcessState next) {
         sampleValid = false;
     } else if (next == ProcessState::DRAIN) {
         pump3On(true);       // LED off via setAllOutputsOff() above — measurement done
+    } else if (next == ProcessState::PRIME) {
+        // Priming is not metered, so drive the selected pump at full duty.
+        if (primeUsesDyePump) {
+            pump2Full(true);
+        } else {
+            pump1On(true);
+        }
     }
 
     broadcastStatus();
+}
+
+// Kick off a line prime. Only legal from IDLE so a prime can never interrupt a
+// measurement mid-cycle. Returns false if busy; the caller reports that as 409.
+static bool startPrime(bool useDyePump, uint32_t ms) {
+    if (currentState != ProcessState::IDLE) {
+        return false;
+    }
+    if (ms < PRIME_MS_MIN) ms = PRIME_MS_MIN;
+    if (ms > PRIME_MS_MAX) ms = PRIME_MS_MAX;
+    primeUsesDyePump = useDyePump;
+    primeMs = ms;
+    setState(ProcessState::PRIME);
+    return true;
 }
 
 static void handleWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
@@ -913,6 +1054,13 @@ static void setupServer() {
         setBaseFillSeconds(seconds);
       }
 
+      // Preferred over baseFillSec: 1 s of fill is 0.617 mL, too coarse to hit
+      // the 15.65 mL target. Takes precedence if both params are supplied.
+      if (request->hasParam("baseFillMs")) {
+        long ms = request->getParam("baseFillMs")->value().toInt();
+        setBaseFillMs((uint32_t)(ms < 0 ? 0 : ms));
+      }
+
       if (request->hasParam("drainDuty")) {
         int percent = request->getParam("drainDuty")->value().toInt();
         setDrainDutyPercent(clampPercent(percent));
@@ -932,6 +1080,47 @@ static void setupServer() {
       String payload;
       serializeJson(doc, payload);
       broadcastStatus();
+      request->send(200, "application/json", payload);
+    });
+
+    // Fill a supply line so dead volume is known rather than guessed.
+    //   GET /api/prime?pump=dye|water[&ms=6300]
+    // Defaults come from the measured tube lengths plus a 15% overshoot. Run
+    // with the cell empty and drain afterwards — the overshoot lands inside.
+    server.on("/api/prime", HTTP_GET, [](AsyncWebServerRequest *request) {
+      bool useDye = true;
+      if (request->hasParam("pump")) {
+        String which = request->getParam("pump")->value();
+        which.toLowerCase();
+        if (which == "water" || which == "1" || which == "fill") {
+          useDye = false;
+        } else if (which != "dye" && which != "2") {
+          request->send(400, "application/json",
+                        "{\"error\":\"pump must be dye or water\"}");
+          return;
+        }
+      }
+
+      uint32_t ms = useDye ? PRIME_DYE_MS_DEFAULT : PRIME_WATER_MS_DEFAULT;
+      if (request->hasParam("ms")) {
+        long requested = request->getParam("ms")->value().toInt();
+        if (requested > 0) {
+          ms = (uint32_t)requested;
+        }
+      }
+
+      if (!startPrime(useDye, ms)) {
+        request->send(409, "application/json",
+                      "{\"error\":\"busy; prime is only allowed from idle\"}");
+        return;
+      }
+
+      JsonDocument doc;
+      doc["pump"] = useDye ? "dye" : "water";
+      doc["primeMs"] = primeMs;
+      doc["lineMl"] = useDye ? P2_LINE_ML : P1_LINE_ML;
+      String payload;
+      serializeJson(doc, payload);
       request->send(200, "application/json", payload);
     });
 
@@ -1148,6 +1337,17 @@ static void runStateMachine() {
           }
           break;
 
+        case ProcessState::PRIME:
+          if (now - stateStartMs >= primeMs) {
+            // Only the dye line's primed state gates dosing accuracy; a water
+            // prime just tops up pump 1's column and needs no flag.
+            if (primeUsesDyePump) {
+              dyeLinePrimed = true;
+            }
+            setState(ProcessState::IDLE);
+          }
+          break;
+
         case ProcessState::IDLE:
         default:
             break;
@@ -1269,8 +1469,13 @@ void setup() {
 
     // ---- Configuration Summary ----
     Serial.println("--------------------------------------------");
-    Serial.printf("[CFG]    Base fill:    %u s\n",  baseFillMs / 1000);
-    Serial.printf("[CFG]    Dose:         %u ms\n", doseMs);
+    Serial.printf("[CFG]    Base fill:    %u ms (%.2f mL)\n",
+                  baseFillMs, baseFillMs * PUMP_ML_PER_S / 1000.0f);
+    Serial.printf("[CFG]    Dose:         %u ms (target %.2f mL, primed line)\n",
+                  doseMs, DYE_DOSE_ML);
+    Serial.printf("[CFG]    Dye line:     %.2f mL  prime %u ms\n",
+                  P2_LINE_ML, PRIME_DYE_MS_DEFAULT);
+    Serial.printf("[CFG]    Dye primed:   %s\n", dyeLinePrimed ? "yes" : "NO - run /api/prime?pump=dye");
     Serial.printf("[CFG]    Drain duty:   %u %%\n", drainDutyPercent);
     Serial.printf("[CFG]    Hue branch:   %.1f deg\n", hueBranchCut);
     Serial.printf("[CFG]    Cal points:   %u  (pH %.2f-%.2f)\n",

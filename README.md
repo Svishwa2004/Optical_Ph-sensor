@@ -52,39 +52,77 @@ phenolphthalein (Carc 1A / Muta 2). Keep the reservoir and dye line sealed, vent
 enclosure, keep the concentrate away from the powered LED/pumps, and confirm your tubing
 and gaskets are methanol-compatible.
 
+## Fluidics: measured tube lengths
+All pump timings are derived from the tubing geometry rather than hand-tuned, so re-measuring a
+line means changing one constant. With 3 mm ID silicone each cm holds 0.0707 mL.
+
+| Pump | Inlet | Outlet | Line volume | Notes |
+| --- | --- | --- | --- | --- |
+| 1 water fill | 39 cm | 12 cm | 3.61 mL | reservoir → cell |
+| 2 dye dose | 8 cm | 10 cm | 1.27 mL | outlet alone is 0.71 mL = 2.1× a dose |
+| 3 drain | 12 cm | 46 cm | 4.10 mL | 3.25 mL of dyed waste sits downstream |
+
+Volume budget closes on the cell's 17.09 mL operating volume: 15.65 mL base fill + 0.34 mL dye
+(2% v/v) + 1.10 mL agitation. Absolute cell capacity is 21.36 mL, and the dye injection port sits
+above the operating line.
+
+Two consequences worth knowing before you bench it. The dye outlet holds 2.1× a full dose, so an
+unprimed line swallows the first shot entirely — prime it, and treat `dyeLinePrimed: false` in the
+status JSON as "readings are not trustworthy yet". And pump 3's 46 cm outlet holds enough dyed
+waste to siphon back into the cell, so route it downhill or give it an air break.
+
+If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry block at the top of
+[src/main.cpp](src/main.cpp); every duration recomputes at compile time.
+
 ## API
-- `GET /api/config?baseFillSec=...&drainDuty=...&doseMs=...` updates fill, drain, and dye-dose
-  duration (ms, clamped 200–8000) and saves them to NVS.
+- `GET /api/config?baseFillSec=...&baseFillMs=...&drainDuty=...&doseMs=...` updates fill, drain,
+  and dye-dose duration (ms, clamped 200–8000) and saves them to NVS. Prefer `baseFillMs`:
+  one second of fill is 0.617 mL, which is 3.6% of the cell and too coarse to land on target.
+  `baseFillMs` wins if both are supplied.
+- `GET /api/prime?pump=dye|water[&ms=...]` runs a supply pump to fill its line, so dead volume is
+  known rather than assumed. Defaults cover the measured line plus 15% overshoot (dye 6300 ms,
+  water 7000 ms). Only allowed from idle (409 otherwise); run with the cell empty and drain after.
 - `GET /api/calibrate?points=pH:hue,pH:hue,...` replaces the whole hue→pH table (2–8 points,
   pH and hue both strictly ascending). Optional `&hueCut=<deg>` sets the hue branch cut
   (wrap point for the circular hue scale; default 320°).
 - `GET /api/calibrate/capture?ph=<known>` records the current live hue from the most recent
   measurement as the hue for that buffer pH, inserting/replacing the matching table point.
   Requires a valid recent reading (adequate saturation/value).
-- `GET /api/status` returns settings, the calibration table + calibrated pH span, and live
-  telemetry (pH, hue/sat/val, per-channel absorbance, and an `extrapolated` flag when the
-  reading falls outside the calibrated hue span).
+- `GET /api/status` returns settings, the calibration table + calibrated pH span, a `fluidics`
+  object with the volumes the current timings deliver, `dyeLinePrimed`, and live telemetry (pH,
+  hue/sat/val, per-channel absorbance, and an `extrapolated` flag when the reading falls outside
+  the calibrated hue span).
 
 ## Bench calibration & dosing procedure
-1. **Set the dye dose.** Start at `doseMs=2700` (≈0.34 mL, ~2% v/v of the 17.09 mL operating
-   volume — the manufacturer's recommended dose). Run a cycle with a mid-pH buffer and check
-   the MEASURE telemetry: saturation/value should be well above the reject gate and not pinned.
-   If colors are too weak, nudge the dose up toward ~3% v/v; if the cell is saturated/opaque,
-   reduce it. Bench-measure the actual mL delivered per dose — the 2700 ms figure assumes the
-   dye line re-pays its dead volume each shot; a primed line may need closer to ~1100 ms.
-   After changing the dose, rebalance the base fill so the cell still reaches ~17.09 mL.
-2. **Capture calibration points.** For each buffer on hand (4.01, 6.86, 9.18), fill the cell,
-   run a full measurement cycle, then call `/api/calibrate/capture?ph=<buffer>` (or use the
-   dashboard's capture control). Capture in ascending pH order.
-3. **Check monotonicity.** Hue must increase with pH across your points. If a capture is
-   rejected as non-monotonic, the branch cut is likely splitting your hue range — adjust
-   `hueCut` so all captured hues fall on one continuous arc, then re-capture.
-4. **Verify the span.** Readings between your lowest and highest buffer are interpolated;
-   outside that span the status reports `extrapolated: true`. Add buffers (up to 8 points) to
-   widen the trustworthy range.
+1. **Prime both lines.** Call `/api/prime?pump=water` then `/api/prime?pump=dye` with the cell
+   empty, then run a drain to clear the overshoot. `dyeLinePrimed` goes true and the dashboard
+   warning clears. Re-prime after any reservoir swap, tube change, or long idle period.
+2. **Verify the fill level.** Run a cycle and watch the base fill: 25378 ms should put 15.65 mL in
+   the cell, cresting the optical windows with headspace to spare. If the level is off, the real
+   pump throughput differs from the nominal 37 mL/min — trim with `/api/config?baseFillMs=...` and
+   note the ratio, since the same error scales the dose and agitation volumes.
+3. **Verify the dose.** Dose into a graduated container and confirm 0.34 mL lands at the default
+   1111 ms. If the delivered volume is short by roughly 0.7 mL, the line drained between runs —
+   re-prime and re-measure rather than inflating `doseMs` to compensate. Trim via
+   `/api/config?doseMs=...`. Check the MEASURE telemetry: saturation and value should sit well
+   above the reject gate without pinning. Weak colour, nudge toward 3% v/v; opaque, back off.
+4. **Capture calibration points.** For each buffer (4.01, 6.86, 9.18), fill the cell, run a full
+   cycle, then call `/api/calibrate/capture?ph=<buffer>` or use the dashboard control. Capture in
+   ascending pH order.
+5. **Check monotonicity.** Hue must increase with pH. If a capture is rejected as non-monotonic,
+   the branch cut is splitting your hue range — adjust `hueCut` so all captured hues fall on one
+   continuous arc, then re-capture.
+6. **Verify the span.** Readings between your lowest and highest buffer are interpolated; outside
+   that span the status reports `extrapolated: true`. Add buffers (up to 8 points) to widen the
+   trustworthy range.
 
 ## Notes
 - The calibration table is empty/placeholder until you capture your own buffers.
+- `dyeLinePrimed` resets to false on every boot by design — the firmware cannot know whether the
+  line drained while powered down.
+- Two stale NVS values are discarded on load: a 33000 ms base fill (never bench-verified, delivers
+  20.35 mL and overfills past the 17.09 mL cap) and a 2700 ms dose (derived from an assumed 49.5 mm
+  dead-volume segment rather than the measured 10 cm outlet). Both fall back to the derived default.
 - Legacy 3-ratio calibration keys (`calPh4/calPh55/calPh7`) from the old B/G-ratio model are
   discarded from NVS on first save.
 - If the sensor is not detected at boot, the firmware retries in the background.
