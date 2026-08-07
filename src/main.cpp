@@ -106,13 +106,17 @@ static constexpr uint32_t pump2Ms(float ml) {
 }
 
 // ----- Timing (ms) -----
-// 15.65 mL at 0.6167 mL/s = 25378 ms. Assumes the pump-1 line is already full:
-// the peristaltic rollers pinch the tube shut when unpowered, so the 39 cm
-// inlet holds its column between runs. Run /api/prime?pump=water once after a
-// tube change or reservoir swap. The previous 33000 ms was never bench-verified
-// and delivers 20.35 mL — past the 17.09 mL operating cap before dye or
-// agitation water is added.
-static const uint32_t BASE_FILL_MS_DEFAULT = pump1Ms(BASE_FILL_ML);
+// Geometry predicts pump1Ms(15.65 mL) = 25378 ms at the nominal 0.6167 mL/s.
+// Overridden to 24000 ms at the user's request (bench run showed 25 s a touch
+// high). That implies the real rate is nearer 0.652 mL/s; if a future bench
+// pass confirms it, correct PUMP_ML_PER_S instead so dose and prime re-derive
+// too, and drop this override back to pump1Ms(BASE_FILL_ML). Assumes the pump-1
+// line is already full: the peristaltic rollers pinch the tube shut when
+// unpowered, so the 39 cm inlet holds its column between runs. Run
+// /api/prime?pump=water once after a tube change or reservoir swap. The previous
+// 33000 ms was never bench-verified and delivers 20.35 mL — past the 17.09 mL
+// operating cap before dye or agitation water is added.
+static const uint32_t BASE_FILL_MS_DEFAULT = 24000;
 static const uint32_t BASE_FILL_MS_MIN = 5000;
 static const uint32_t BASE_FILL_MS_MAX = 120000;
 // Stale NVS values from the pre-geometry firmware, discarded on load.

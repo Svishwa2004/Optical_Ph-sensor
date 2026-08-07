@@ -97,9 +97,10 @@ If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry bloc
 1. **Prime both lines.** Call `/api/prime?pump=water` then `/api/prime?pump=dye` with the cell
    empty, then run a drain to clear the overshoot. `dyeLinePrimed` goes true and the dashboard
    warning clears. Re-prime after any reservoir swap, tube change, or long idle period.
-2. **Verify the fill level.** Run a cycle and watch the base fill: 25378 ms should put 15.65 mL in
-   the cell, cresting the optical windows with headspace to spare. If the level is off, the real
-   pump throughput differs from the nominal 37 mL/min — trim with `/api/config?baseFillMs=...` and
+2. **Verify the fill level.** Run a cycle and watch the base fill. The default is 24000 ms (a
+   manual override; geometry predicts 25378 ms for 15.65 mL at the nominal 37 mL/min, but the
+   pump runs slightly fast). The level should crest the optical windows with headspace to spare.
+   If it is off, trim with `/api/config?baseFillMs=...` and
    note the ratio, since the same error scales the dose and agitation volumes.
 3. **Verify the dose.** Dose into a graduated container and confirm 0.34 mL lands at the default
    1111 ms. If the delivered volume is short by roughly 0.7 mL, the line drained between runs —

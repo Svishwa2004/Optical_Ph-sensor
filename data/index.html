@@ -361,7 +361,7 @@ header {
       </div>
       <div class="config-row">
         <label class="config-label" for="baseFillInput">Base Fill (ms)</label>
-        <input id="baseFillInput" class="config-input" type="number" min="5000" max="120000" step="100" value="25378"/>
+        <input id="baseFillInput" class="config-input" type="number" min="5000" max="120000" step="100" value="24000"/>
         <button id="baseFillApply" class="config-button" type="button">Apply</button>
         <div id="baseFillHint" class="config-hint">--</div>
       </div>
@@ -654,9 +654,8 @@ function updateCalibrationUI(d) {
   }
 }
 
-// Sends baseFillMs, not baseFillSec: the derived default is 25378 ms, and
-// rounding that to whole seconds would drop 0.23 mL from the cell every time
-// someone touched Apply.
+// Sends baseFillMs, not baseFillSec: the default is 24000 ms, and rounding to
+// whole seconds would drop ~0.6 mL from the cell every time someone touched Apply.
 function applyBaseFill() {
   const rawValue = parseInt(baseFillInput.value, 10);
   if (!Number.isFinite(rawValue)) {
