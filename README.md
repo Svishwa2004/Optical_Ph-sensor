@@ -40,13 +40,53 @@ static const char *WIFI_PASS = "YOUR_PASSWORD";
 - Connect your browser to the ESP32 IP shown in serial logs.
 - Click "Start Cycle" to begin a measurement run.
 
+## Reagent: universal indicator (pH 1–14)
+This build maps color to pH for a Yamada-type **universal indicator** whose hue sweeps
+red → yellow → green → blue → violet across pH 1–14. Instead of a single blue/green
+absorbance ratio (which is only monotonic over a narrow band), the firmware converts the
+baseline-normalized sample color to **HSV hue** and maps hue → pH through a calibration
+table of `{pH, hue}` points.
+
+Safety: the concentrate is ~45% methanol (flash point ~19 °C, flammable) and contains
+phenolphthalein (Carc 1A / Muta 2). Keep the reservoir and dye line sealed, ventilate the
+enclosure, keep the concentrate away from the powered LED/pumps, and confirm your tubing
+and gaskets are methanol-compatible.
+
 ## API
-- `GET /api/config?baseFillSec=...&drainDuty=...` updates the runtime fill and drain settings and saves them to NVS.
-- `GET /api/calibrate?ph4Ratio=...&ph55Ratio=...&ph7Ratio=...` stores the three calibration ratios used by the pH mapping.
-- `GET /api/status` returns the current settings, calibration values, and live telemetry.
+- `GET /api/config?baseFillSec=...&drainDuty=...&doseMs=...` updates fill, drain, and dye-dose
+  duration (ms, clamped 200–8000) and saves them to NVS.
+- `GET /api/calibrate?points=pH:hue,pH:hue,...` replaces the whole hue→pH table (2–8 points,
+  pH and hue both strictly ascending). Optional `&hueCut=<deg>` sets the hue branch cut
+  (wrap point for the circular hue scale; default 320°).
+- `GET /api/calibrate/capture?ph=<known>` records the current live hue from the most recent
+  measurement as the hue for that buffer pH, inserting/replacing the matching table point.
+  Requires a valid recent reading (adequate saturation/value).
+- `GET /api/status` returns settings, the calibration table + calibrated pH span, and live
+  telemetry (pH, hue/sat/val, per-channel absorbance, and an `extrapolated` flag when the
+  reading falls outside the calibrated hue span).
+
+## Bench calibration & dosing procedure
+1. **Set the dye dose.** Start at `doseMs=2700` (≈0.34 mL, ~2% v/v of the 17.09 mL operating
+   volume — the manufacturer's recommended dose). Run a cycle with a mid-pH buffer and check
+   the MEASURE telemetry: saturation/value should be well above the reject gate and not pinned.
+   If colors are too weak, nudge the dose up toward ~3% v/v; if the cell is saturated/opaque,
+   reduce it. Bench-measure the actual mL delivered per dose — the 2700 ms figure assumes the
+   dye line re-pays its dead volume each shot; a primed line may need closer to ~1100 ms.
+   After changing the dose, rebalance the base fill so the cell still reaches ~17.09 mL.
+2. **Capture calibration points.** For each buffer on hand (4.01, 6.86, 9.18), fill the cell,
+   run a full measurement cycle, then call `/api/calibrate/capture?ph=<buffer>` (or use the
+   dashboard's capture control). Capture in ascending pH order.
+3. **Check monotonicity.** Hue must increase with pH across your points. If a capture is
+   rejected as non-monotonic, the branch cut is likely splitting your hue range — adjust
+   `hueCut` so all captured hues fall on one continuous arc, then re-capture.
+4. **Verify the span.** Readings between your lowest and highest buffer are interpolated;
+   outside that span the status reports `extrapolated: true`. Add buffers (up to 8 points) to
+   widen the trustworthy range.
 
 ## Notes
-- Calibration constants are placeholders until you measure your own buffers.
+- The calibration table is empty/placeholder until you capture your own buffers.
+- Legacy 3-ratio calibration keys (`calPh4/calPh55/calPh7`) from the old B/G-ratio model are
+  discarded from NVS on first save.
 - If the sensor is not detected at boot, the firmware retries in the background.
 - If the LittleFS UI is missing, `/` returns a 404 message that tells you to upload `data/index.html`.
 

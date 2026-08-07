@@ -55,8 +55,15 @@ static const uint16_t BASE_FILL_SEC_MAX = 120;
 static uint32_t baseFillMs = BASE_FILL_MS_DEFAULT;
 static const uint32_t BLANKING_WARMUP_MS = 2000;
 static const uint32_t BLANKING_SAMPLE_MS = 1000;
-// ----- MICRO_DOSE_MS Derivation (from physical tubing geometry) -----
-// Target delivery:       1.19 mL into the flowcell (per project doc Section 3)
+// ----- doseMs Derivation (from physical tubing geometry) -----
+// Target delivery:       0.34 mL into the flowcell.
+//
+//   Techno Pharmchem universal indicator (pH 1-14) spec is 0.2 mL per 10 mL
+//   of sample = 2.0% v/v. Operating cell volume is 17.09 mL (project doc
+//   Section 3), so 2% = 0.342 mL. (The previous 1.19 mL = 6.98% v/v was tuned
+//   for the old 0.04% BTB/MR custom dye; the universal indicator carries
+//   ~0.084% total dyes, ~2x more concentrated per mL, so the old volume would
+//   over-saturate the cell and crush hue resolution at the pH extremes.)
 //
 // Tubing dimensions:     3 mm ID / 5 mm OD silicone
 //   Total tube length:   175 mm
@@ -67,7 +74,7 @@ static const uint32_t BLANKING_SAMPLE_MS = 1000;
 //   V_dead = pi * r^2 * L = pi * 1.5^2 * 49.5 = 350 mm^3 = 0.350 mL
 //
 // Total volume pump must displace:
-//   V_total = 1.19 + 0.350 = 1.540 mL
+//   V_total = 0.34 + 0.350 = 0.690 mL
 //
 // Flow rates:
 //   At 100% duty (kick): 37 mL/min = 0.6167 mL/s
@@ -77,16 +84,23 @@ static const uint32_t BLANKING_SAMPLE_MS = 1000;
 //   V_kick = 0.6167 * 0.250 = 0.154 mL
 //
 // Remaining volume after kick:
-//   V_steady = 1.540 - 0.154 = 1.386 mL
+//   V_steady = 0.690 - 0.154 = 0.536 mL
 //
 // Time at steady 35% duty:
-//   t_steady = 1.386 / 0.2158 = 6.423 s = 6423 ms
+//   t_steady = 0.536 / 0.2158 = 2.484 s = 2484 ms
 //
-// Total MICRO_DOSE_MS = PUMP2_KICK_MS + t_steady = 250 + 6423 = 6673 ms
-// Rounded to nearest 50 ms = 6650 ms
+// Default doseMs = PUMP2_KICK_MS + t_steady = 250 + 2484 = 2734 ms
+// Rounded to nearest 50 ms = 2700 ms
 //
-// Re-calibrate if: tubing is replaced, PUMP2_DUTY changes, or pump is swapped.
-static const uint32_t MICRO_DOSE_MS = 6650;
+// ** BENCH-VERIFY THIS. ** The dead-volume term assumes the dye line is EMPTY
+// at the start of each dose (0.35 mL re-primed every cycle). If the line stays
+// primed between runs, the true figure is closer to ~1100 ms. Dose into a
+// graduated container and trim doseMs at runtime via /api/config?doseMs=...
+// until 0.34 mL is delivered. Also re-tune if tubing/PUMP2_DUTY/pump changes.
+static const uint32_t DOSE_MS_DEFAULT = 2700;
+static const uint32_t DOSE_MS_MIN = 200;
+static const uint32_t DOSE_MS_MAX = 8000;
+static uint32_t doseMs = DOSE_MS_DEFAULT;
 static const uint32_t AGITATION_MS = 1780;
 static const uint32_t DIFFUSION_MS = 15000;
 static const uint32_t MEASURE_WARMUP_MS = 1000;
@@ -100,10 +114,43 @@ static const uint16_t SENSOR_ZERO_RETRY_DELAY_MS = 50;
 static const uint8_t SAMPLE_COUNT = 10;
 static const uint16_t SAMPLE_SPACING_MS = 100;
 
-// ----- Calibration (placeholder values) -----
-static float CAL_RATIO_PH4 = 1.60f;
-static float CAL_RATIO_PH55 = 1.10f;
-static float CAL_RATIO_PH7 = 0.70f;
+// ----- Calibration: hue -> pH multi-point table -----
+// The Yamada-type universal indicator sweeps hue monotonically across the full
+// pH range (red -> orange -> yellow -> green -> blue -> violet as pH climbs
+// 1 -> 14). We therefore map HSV hue (in degrees, "unwrapped" through a branch
+// cut so the red end stays low) to pH by piecewise-linear interpolation through
+// a table of {pH, hue} points captured against known buffers. Readings whose pH
+// falls outside the calibrated span are still reported, but flagged extrapolated.
+//
+// The defaults below are PLACEHOLDERS approximating typical universal-indicator
+// hues. They MUST be replaced by bench calibration against the user's buffers
+// (4.01, 6.86, 9.18) via /api/calibrate/capture before readings are trusted.
+static const uint8_t CAL_MAX_POINTS = 8;
+static const uint8_t CAL_MIN_POINTS = 2;
+struct CalPoint {
+    float ph;   // known buffer pH
+    float hue;  // measured unwrapped hue, degrees (ascending with pH)
+};
+static CalPoint calPoints[CAL_MAX_POINTS] = {
+    {2.0f,   0.0f},
+    {4.0f,  35.0f},
+    {6.0f,  65.0f},
+    {7.0f,  95.0f},
+    {9.0f, 170.0f},
+    {12.0f, 280.0f},
+};
+static uint8_t calCount = 6;
+
+// Hue branch cut (degrees). Hues at/above this threshold are shifted down by 360
+// so the red (acidic) end reads as a small/negative value and the whole ramp
+// stays monotonically ascending with pH. Tunable if the dye's red end wraps.
+static const float HUE_BRANCH_CUT_DEFAULT = 320.0f;
+static float hueBranchCut = HUE_BRANCH_CUT_DEFAULT;
+
+// Saturation/value sanity gates: a well-dyed, well-lit cell should be colorful
+// and bright. Readings below these (near-grey or near-black) are unreliable.
+static const float MIN_VALID_SATURATION = 0.10f;
+static const float MIN_VALID_VALUE = 0.04f;
 
 // ----- WiFi (hardcoded) -----
 static const char *WIFI_SSID = "Sahan’s iPhone";
@@ -186,8 +233,12 @@ static unsigned long lastButtonChangeMs = 0;
 static RawReading baseline = {0, 0, 0, 0};
 static RawReading sample = {0, 0, 0, 0};
 static Absorbance lastAbs = {NAN, NAN, NAN};
-static float lastRatio = NAN;
+static float lastRatio = NAN;  // legacy B/G ratio, kept for diagnostics
 static float lastPh = NAN;
+static float lastHue = NAN;       // unwrapped hue in degrees
+static float lastSat = NAN;       // saturation [0,1]
+static float lastVal = NAN;       // value [0,1]
+static bool lastExtrapolated = false;  // pH outside calibrated span?
 
 // ----- Web UI -----
 // Served from LittleFS at /index.html.
@@ -209,6 +260,20 @@ static uint8_t percentToDuty(uint8_t percent) {
   return static_cast<uint8_t>((percent * 255 + 50) / 100);
 }
 
+// A valid calibration table has 2..CAL_MAX_POINTS entries, all finite, with pH
+// strictly ascending AND hue strictly ascending (so hueToPh is single-valued).
+static bool validateCalPoints(const CalPoint *pts, uint8_t count) {
+  if (count < CAL_MIN_POINTS || count > CAL_MAX_POINTS) return false;
+  for (uint8_t i = 0; i < count; i++) {
+    if (!std::isfinite(pts[i].ph) || !std::isfinite(pts[i].hue)) return false;
+    if (i > 0) {
+      if (pts[i].ph <= pts[i - 1].ph) return false;
+      if (pts[i].hue <= pts[i - 1].hue) return false;
+    }
+  }
+  return true;
+}
+
 static void saveSettings() {
   if (!preferencesReady) {
     return;
@@ -216,9 +281,15 @@ static void saveSettings() {
 
   preferences.putUInt("baseFillMs", baseFillMs);
   preferences.putUChar("drainDuty", drainDutyPercent);
-  preferences.putFloat("calPh4", CAL_RATIO_PH4);
-  preferences.putFloat("calPh55", CAL_RATIO_PH55);
-  preferences.putFloat("calPh7", CAL_RATIO_PH7);
+  preferences.putUInt("doseMs", doseMs);
+  preferences.putFloat("hueCut", hueBranchCut);
+  preferences.putUChar("calCount", calCount);
+  preferences.putBytes("calPoints", calPoints, calCount * sizeof(CalPoint));
+
+  // Discard legacy 3-ratio calibration keys from the old B/G-ratio model.
+  if (preferences.isKey("calPh4")) preferences.remove("calPh4");
+  if (preferences.isKey("calPh55")) preferences.remove("calPh55");
+  if (preferences.isKey("calPh7")) preferences.remove("calPh7");
 }
 
 static void loadSettings() {
@@ -240,18 +311,38 @@ static void loadSettings() {
   }
   drainPwmDuty = percentToDuty(drainDutyPercent);
 
-  if (preferences.isKey("calPh4") && preferences.isKey("calPh55") && preferences.isKey("calPh7")) {
-    float storedPh4 = preferences.getFloat("calPh4", CAL_RATIO_PH4);
-    float storedPh55 = preferences.getFloat("calPh55", CAL_RATIO_PH55);
-    float storedPh7 = preferences.getFloat("calPh7", CAL_RATIO_PH7);
-    if (std::isfinite(storedPh4) && std::isfinite(storedPh55) && std::isfinite(storedPh7) &&
-        storedPh4 > storedPh55 && storedPh55 > storedPh7) {
-      CAL_RATIO_PH4 = storedPh4;
-      CAL_RATIO_PH55 = storedPh55;
-      CAL_RATIO_PH7 = storedPh7;
-    } else {
-      Serial.println("Calibration values invalid; keeping defaults.");
+  if (preferences.isKey("doseMs")) {
+    uint32_t storedDose = preferences.getUInt("doseMs", DOSE_MS_DEFAULT);
+    if (storedDose < DOSE_MS_MIN) storedDose = DOSE_MS_MIN;
+    if (storedDose > DOSE_MS_MAX) storedDose = DOSE_MS_MAX;
+    doseMs = storedDose;
+  }
+
+  if (preferences.isKey("hueCut")) {
+    float storedCut = preferences.getFloat("hueCut", HUE_BRANCH_CUT_DEFAULT);
+    if (std::isfinite(storedCut) && storedCut > 0.0f && storedCut <= 360.0f) {
+      hueBranchCut = storedCut;
     }
+  }
+
+  if (preferences.isKey("calCount") && preferences.isKey("calPoints")) {
+    uint8_t storedCount = preferences.getUChar("calCount", 0);
+    if (storedCount >= CAL_MIN_POINTS && storedCount <= CAL_MAX_POINTS) {
+      CalPoint tmp[CAL_MAX_POINTS];
+      size_t want = storedCount * sizeof(CalPoint);
+      size_t got = preferences.getBytes("calPoints", tmp, want);
+      if (got == want && validateCalPoints(tmp, storedCount)) {
+        memcpy(calPoints, tmp, want);
+        calCount = storedCount;
+      } else {
+        Serial.println("Stored calibration table invalid; keeping defaults.");
+      }
+    }
+  } else if (preferences.isKey("calPh4")) {
+    // Migration: an old 3-ratio calibration exists but no hue table. The ratio
+    // model is incompatible with the universal indicator, so discard it and
+    // fall back to the placeholder hue table (must be re-calibrated on bench).
+    Serial.println("Legacy ratio calibration found; discarding — recalibrate hue table.");
   }
 }
 
@@ -274,23 +365,27 @@ static void setDrainDutyPercent(uint8_t percent, bool persist = true) {
   }
 }
 
-static bool setCalibrationRatios(float ph4, float ph55, float ph7, bool persist = true) {
-  if (!std::isfinite(ph4) || !std::isfinite(ph55) || !std::isfinite(ph7)) {
-    return false;
-  }
-
-  if (!(ph4 > ph55 && ph55 > ph7)) {
-    return false;
-  }
-
-  CAL_RATIO_PH4 = ph4;
-  CAL_RATIO_PH55 = ph55;
-  CAL_RATIO_PH7 = ph7;
-
+static uint32_t setDoseMs(uint32_t requested, bool persist = true) {
+  if (requested < DOSE_MS_MIN) requested = DOSE_MS_MIN;
+  if (requested > DOSE_MS_MAX) requested = DOSE_MS_MAX;
+  doseMs = requested;
   if (persist) {
     saveSettings();
   }
+  return doseMs;
+}
 
+// Replace the whole calibration table atomically. Validates before committing so
+// a bad request never leaves a partially-updated (non-monotonic) table.
+static bool setCalibrationPoints(const CalPoint *pts, uint8_t count, bool persist = true) {
+  if (!validateCalPoints(pts, count)) {
+    return false;
+  }
+  memcpy(calPoints, pts, count * sizeof(CalPoint));
+  calCount = count;
+  if (persist) {
+    saveSettings();
+  }
   return true;
 }
 
@@ -413,19 +508,86 @@ static float computeRatio(const Absorbance &a) {
     return a.b / a.g;
 }
 
-static float mapRatioToPH(float ratio) {
-    if (isnan(ratio)) return NAN;
+struct Hsv {
+    float h;  // hue, degrees [0,360)
+    float s;  // saturation [0,1]
+    float v;  // value [0,1]
+};
 
-  if (ratio >= CAL_RATIO_PH4) return 4.0f;
-  if (ratio <= CAL_RATIO_PH7) return 7.0f;
+// Compute the transmitted colour of the dyed sample relative to the clear-water
+// baseline, then convert to HSV. Dividing by the baseline removes the light
+// source and any nutrient-solution tint captured during Dynamic Blanking, so
+// what remains is the dye's own colour. Returns hue in [0,360); NAN if invalid.
+static Hsv computeHsv(const RawReading &base, const RawReading &test) {
+    Hsv out = {NAN, NAN, NAN};
+    float tr = safeTransmittance((float)test.r, (float)base.r);
+    float tg = safeTransmittance((float)test.g, (float)base.g);
+    float tb = safeTransmittance((float)test.b, (float)base.b);
 
-    if (ratio >= CAL_RATIO_PH55) {
-        float t = (ratio - CAL_RATIO_PH55) / (CAL_RATIO_PH4 - CAL_RATIO_PH55);
-        return 5.5f - t * 1.5f;
+    float cmax = fmaxf(tr, fmaxf(tg, tb));
+    float cmin = fminf(tr, fminf(tg, tb));
+    float delta = cmax - cmin;
+
+    out.v = cmax;
+    out.s = (cmax <= 0.0f) ? 0.0f : (delta / cmax);
+
+    if (delta <= 1e-6f) {
+        out.h = 0.0f;  // achromatic; hue undefined, saturation gate will reject
+        return out;
     }
 
-    float t = (ratio - CAL_RATIO_PH7) / (CAL_RATIO_PH55 - CAL_RATIO_PH7);
-    return 7.0f - t * 1.5f;
+    float h;
+    if (cmax == tr) {
+        h = 60.0f * fmodf(((tg - tb) / delta), 6.0f);
+    } else if (cmax == tg) {
+        h = 60.0f * (((tb - tr) / delta) + 2.0f);
+    } else {
+        h = 60.0f * (((tr - tg) / delta) + 4.0f);
+    }
+    if (h < 0.0f) h += 360.0f;
+    out.h = h;
+    return out;
+}
+
+// Shift the red (acidic) end below the branch cut so the ramp stays monotonic
+// with pH. Hues at/above hueBranchCut are pulled down by 360 degrees.
+static float unwrapHue(float hue) {
+    if (isnan(hue)) return NAN;
+    return (hue >= hueBranchCut) ? hue - 360.0f : hue;
+}
+
+// Piecewise-linear interpolation of unwrapped hue -> pH through calPoints.
+// Sets outExtrapolated when the hue lies outside the calibrated span (the
+// result is a linear extrapolation off the nearest segment). calPoints must be
+// sorted ascending in both pH and hue (enforced at set time).
+static float hueToPh(float unwrappedHue, bool &outExtrapolated) {
+    outExtrapolated = false;
+    if (isnan(unwrappedHue) || calCount < CAL_MIN_POINTS) return NAN;
+
+    if (unwrappedHue <= calPoints[0].hue) {
+        outExtrapolated = (unwrappedHue < calPoints[0].hue);
+        float h0 = calPoints[0].hue, h1 = calPoints[1].hue;
+        float p0 = calPoints[0].ph, p1 = calPoints[1].ph;
+        if (h1 == h0) return p0;
+        return p0 + (unwrappedHue - h0) * (p1 - p0) / (h1 - h0);
+    }
+    uint8_t last = calCount - 1;
+    if (unwrappedHue >= calPoints[last].hue) {
+        outExtrapolated = (unwrappedHue > calPoints[last].hue);
+        float h0 = calPoints[last - 1].hue, h1 = calPoints[last].hue;
+        float p0 = calPoints[last - 1].ph, p1 = calPoints[last].ph;
+        if (h1 == h0) return p1;
+        return p0 + (unwrappedHue - h0) * (p1 - p0) / (h1 - h0);
+    }
+    for (uint8_t i = 0; i < last; i++) {
+        float h0 = calPoints[i].hue, h1 = calPoints[i + 1].hue;
+        if (unwrappedHue >= h0 && unwrappedHue <= h1) {
+            float p0 = calPoints[i].ph, p1 = calPoints[i + 1].ph;
+            if (h1 == h0) return p0;
+            return p0 + (unwrappedHue - h0) * (p1 - p0) / (h1 - h0);
+        }
+    }
+    return NAN;
 }
 
 static const char *getStateLabel(ProcessState state) {
@@ -462,7 +624,7 @@ static uint32_t getStateDuration(ProcessState state) {
         // Duration matches actual readAverageRaw() execution time so the
         // progress bar stays in sync regardless of SAMPLE_COUNT / SAMPLE_SPACING_MS.
         case ProcessState::BLANKING: return BLANKING_WARMUP_MS + (uint32_t)(SAMPLE_COUNT * SAMPLE_SPACING_MS);
-        case ProcessState::MICRO_DOSE: return MICRO_DOSE_MS;
+        case ProcessState::MICRO_DOSE: return doseMs;
         case ProcessState::AGITATION: return AGITATION_MS;
         case ProcessState::DIFFUSION: return DIFFUSION_MS;
         case ProcessState::MEASURE:  return MEASURE_WARMUP_MS  + (uint32_t)(SAMPLE_COUNT * SAMPLE_SPACING_MS);
@@ -492,6 +654,7 @@ static String buildStatusJson() {
     doc["remainingMs"] = duration > elapsed ? (duration - elapsed) : 0;
     doc["baseFillMs"] = baseFillMs;
     doc["baseFillSec"] = baseFillMs / 1000;
+    doc["doseMs"] = doseMs;
     doc["baselineValid"] = baselineValid;
     doc["sampleValid"] = sampleValid;
     doc["drainDutyPercent"] = drainDutyPercent;
@@ -501,16 +664,31 @@ static String buildStatusJson() {
     doc["sensorConnected"] = sensorConnected;
     doc["canStart"] = sensorConnected && sensorHealthy && currentState == ProcessState::IDLE;
 
+    // Calibration: N-point hue->pH table + branch cut, plus the calibrated span.
     JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
-    calibrationObj["ph4"] = CAL_RATIO_PH4;
-    calibrationObj["ph55"] = CAL_RATIO_PH55;
-    calibrationObj["ph7"] = CAL_RATIO_PH7;
+    calibrationObj["hueBranchCut"] = hueBranchCut;
+    calibrationObj["count"] = calCount;
+    calibrationObj["phMin"] = calCount > 0 ? calPoints[0].ph : (float)NAN;
+    calibrationObj["phMax"] = calCount > 0 ? calPoints[calCount - 1].ph : (float)NAN;
+    JsonArray pointsArr = calibrationObj["points"].to<JsonArray>();
+    for (uint8_t i = 0; i < calCount; i++) {
+        JsonObject p = pointsArr.add<JsonObject>();
+        p["ph"] = calPoints[i].ph;
+        p["hue"] = calPoints[i].hue;
+    }
 
     if (isnan(lastPh)) {
         doc["ph"] = nullptr;
     } else {
         doc["ph"] = lastPh;
     }
+    doc["extrapolated"] = lastExtrapolated;
+
+    // HSV telemetry (drives the reading now; ratio kept for diagnostics).
+    JsonObject hsvObj = doc["hsv"].to<JsonObject>();
+    if (isnan(lastHue)) { hsvObj["h"] = nullptr; } else { hsvObj["h"] = lastHue; }
+    if (isnan(lastSat)) { hsvObj["s"] = nullptr; } else { hsvObj["s"] = lastSat; }
+    if (isnan(lastVal)) { hsvObj["v"] = nullptr; } else { hsvObj["v"] = lastVal; }
 
     if (isnan(lastRatio)) {
         doc["ratio"] = nullptr;
@@ -637,6 +815,81 @@ static void handleWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
   }
 }
 
+// Serialize the active calibration table into a JSON object (shared by the
+// /api/calibrate responses so their shape matches buildStatusJson's).
+static void writeCalibrationJson(JsonObject obj) {
+  obj["hueBranchCut"] = hueBranchCut;
+  obj["count"] = calCount;
+  obj["phMin"] = calCount > 0 ? calPoints[0].ph : (float)NAN;
+  obj["phMax"] = calCount > 0 ? calPoints[calCount - 1].ph : (float)NAN;
+  JsonArray arr = obj["points"].to<JsonArray>();
+  for (uint8_t i = 0; i < calCount; i++) {
+    JsonObject p = arr.add<JsonObject>();
+    p["ph"] = calPoints[i].ph;
+    p["hue"] = calPoints[i].hue;
+  }
+}
+
+// Parse a "ph:hue,ph:hue,..." string into a CalPoint array. Returns the count
+// parsed (0 on malformed input or overflow). Does NOT validate monotonicity —
+// that is left to setCalibrationPoints.
+static uint8_t parseCalPoints(const String &s, CalPoint *out) {
+  uint8_t n = 0;
+  int start = 0;
+  while (start < (int)s.length() && n < CAL_MAX_POINTS) {
+    int comma = s.indexOf(',', start);
+    String token = (comma < 0) ? s.substring(start) : s.substring(start, comma);
+    token.trim();
+    if (token.length() > 0) {
+      int colon = token.indexOf(':');
+      if (colon < 0) return 0;  // malformed pair
+      out[n].ph = token.substring(0, colon).toFloat();
+      out[n].hue = token.substring(colon + 1).toFloat();
+      n++;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return n;
+}
+
+// Insert or replace a calibration point at a known pH using a measured hue,
+// keeping the table sorted by pH. Writes the result into `out` and returns the
+// new count, or 0 if the table would overflow.
+static uint8_t upsertCalPoint(float ph, float hue, CalPoint *out) {
+  const float PH_EPS = 0.05f;
+  uint8_t n = 0;
+  bool replaced = false;
+  for (uint8_t i = 0; i < calCount; i++) {
+    if (fabsf(calPoints[i].ph - ph) <= PH_EPS) {
+      out[n].ph = ph;
+      out[n].hue = hue;
+      n++;
+      replaced = true;
+    } else {
+      if (n >= CAL_MAX_POINTS) return 0;
+      out[n++] = calPoints[i];
+    }
+  }
+  if (!replaced) {
+    if (n >= CAL_MAX_POINTS) return 0;
+    out[n].ph = ph;
+    out[n].hue = hue;
+    n++;
+    // Sort ascending by pH (tiny table — simple insertion sort).
+    for (uint8_t i = 1; i < n; i++) {
+      CalPoint key = out[i];
+      int j = i - 1;
+      while (j >= 0 && out[j].ph > key.ph) {
+        out[j + 1] = out[j];
+        j--;
+      }
+      out[j + 1] = key;
+    }
+  }
+  return n;
+}
+
 static void setupServer() {
     ws.onEvent(handleWebsocketEvent);
     server.addHandler(&ws);
@@ -665,37 +918,48 @@ static void setupServer() {
         setDrainDutyPercent(clampPercent(percent));
       }
 
+      if (request->hasParam("doseMs")) {
+        long ms = request->getParam("doseMs")->value().toInt();
+        setDoseMs((uint32_t)(ms < 0 ? 0 : ms));
+      }
+
       JsonDocument doc;
       doc["baseFillMs"] = baseFillMs;
       doc["baseFillSec"] = baseFillMs / 1000;
+      doc["doseMs"] = doseMs;
       doc["drainDutyPercent"] = drainDutyPercent;
       doc["drainDutyRaw"] = drainPwmDuty;
-      JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
-      calibrationObj["ph4"] = CAL_RATIO_PH4;
-      calibrationObj["ph55"] = CAL_RATIO_PH55;
-      calibrationObj["ph7"] = CAL_RATIO_PH7;
       String payload;
       serializeJson(doc, payload);
       broadcastStatus();
       request->send(200, "application/json", payload);
     });
 
+    // Replace the whole hue->pH table. Also accepts an optional branch-cut.
+    //   GET /api/calibrate?points=4.01:35,6.86:95,9.18:180[&hueCut=320]
     server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest *request) {
-      if (!request->hasParam("ph4Ratio") || !request->hasParam("ph55Ratio") || !request->hasParam("ph7Ratio")) {
+      if (request->hasParam("hueCut")) {
+        float cut = request->getParam("hueCut")->value().toFloat();
+        if (std::isfinite(cut) && cut > 0.0f && cut <= 360.0f) {
+          hueBranchCut = cut;
+        }
+      }
+
+      if (!request->hasParam("points")) {
         JsonDocument errorDoc;
-        errorDoc["error"] = "Missing calibration ratios";
+        errorDoc["error"] = "Missing points=ph:hue,ph:hue,... (2-8 points)";
         String payload;
         serializeJson(errorDoc, payload);
         request->send(400, "application/json", payload);
         return;
       }
 
-      float ph4 = request->getParam("ph4Ratio")->value().toFloat();
-      float ph55 = request->getParam("ph55Ratio")->value().toFloat();
-      float ph7 = request->getParam("ph7Ratio")->value().toFloat();
-      if (!setCalibrationRatios(ph4, ph55, ph7)) {
+      CalPoint parsed[CAL_MAX_POINTS];
+      uint8_t n = parseCalPoints(request->getParam("points")->value(), parsed);
+      if (!setCalibrationPoints(parsed, n)) {
         JsonDocument errorDoc;
-        errorDoc["error"] = "Calibration ratios must be finite and strictly descending";
+        errorDoc["error"] =
+            "Need 2-8 points, all finite, with pH and hue both strictly ascending";
         String payload;
         serializeJson(errorDoc, payload);
         request->send(400, "application/json", payload);
@@ -703,10 +967,59 @@ static void setupServer() {
       }
 
       JsonDocument doc;
-      JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
-      calibrationObj["ph4"] = CAL_RATIO_PH4;
-      calibrationObj["ph55"] = CAL_RATIO_PH55;
-      calibrationObj["ph7"] = CAL_RATIO_PH7;
+      writeCalibrationJson(doc["calibration"].to<JsonObject>());
+      String payload;
+      serializeJson(doc, payload);
+      broadcastStatus();
+      request->send(200, "application/json", payload);
+    });
+
+    // Capture one calibration point from the most recent live reading:
+    //   GET /api/calibrate/capture?ph=6.86
+    // Uses the current unwrapped hue (from the last MEASURE) as that pH's hue,
+    // inserting or replacing the matching table entry. Run a measurement cycle
+    // with the buffer in the cell first, then call this with its known pH.
+    server.on("/api/calibrate/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (!request->hasParam("ph")) {
+        JsonDocument errorDoc;
+        errorDoc["error"] = "Missing ph= (known buffer pH)";
+        String payload;
+        serializeJson(errorDoc, payload);
+        request->send(400, "application/json", payload);
+        return;
+      }
+      float ph = request->getParam("ph")->value().toFloat();
+
+      if (isnan(lastHue) || isnan(lastSat) || isnan(lastVal) ||
+          lastSat < MIN_VALID_SATURATION || lastVal < MIN_VALID_VALUE) {
+        JsonDocument errorDoc;
+        errorDoc["error"] =
+            "No valid recent reading to capture — run a measurement with this buffer first";
+        String payload;
+        serializeJson(errorDoc, payload);
+        request->send(409, "application/json", payload);
+        return;
+      }
+
+      float hue = unwrapHue(lastHue);
+      CalPoint candidate[CAL_MAX_POINTS];
+      uint8_t n = upsertCalPoint(ph, hue, candidate);
+      if (n == 0 || !setCalibrationPoints(candidate, n)) {
+        JsonDocument errorDoc;
+        errorDoc["error"] =
+            "Captured point makes the table non-monotonic (or table full). "
+            "Check buffer order / branch cut.";
+        errorDoc["capturedHue"] = hue;
+        String payload;
+        serializeJson(errorDoc, payload);
+        request->send(400, "application/json", payload);
+        return;
+      }
+
+      JsonDocument doc;
+      doc["capturedPh"] = ph;
+      doc["capturedHue"] = hue;
+      writeCalibrationJson(doc["calibration"].to<JsonObject>());
       String payload;
       serializeJson(doc, payload);
       broadcastStatus();
@@ -746,7 +1059,7 @@ static void runStateMachine() {
             break;
 
         case ProcessState::MICRO_DOSE:
-            if (now - stateStartMs >= MICRO_DOSE_MS) {
+            if (now - stateStartMs >= doseMs) {
                 setState(ProcessState::AGITATION);
             }
             break;
@@ -772,6 +1085,10 @@ static void runStateMachine() {
               lastAbs = {NAN, NAN, NAN};
               lastRatio = NAN;
               lastPh = NAN;
+              lastHue = NAN;
+              lastSat = NAN;
+              lastVal = NAN;
+              lastExtrapolated = false;
               Serial.printf("[%lu] [MEAS]  FAILED — sensor read error. Draining.\n", millis());
               setState(ProcessState::DRAIN);
               break;
@@ -782,16 +1099,36 @@ static void runStateMachine() {
                               millis(), sample.r, sample.g, sample.b, sample.c);
 
             if (baselineValid) {
+                    // Absorbance/ratio retained for diagnostics only.
                     lastAbs = computeAbsorbance(baseline, sample);
                     lastRatio = computeRatio(lastAbs);
-                    lastPh = mapRatioToPH(lastRatio);
-                    Serial.printf("[%lu] [MEAS]  Abs  R=%.4f G=%.4f B=%.4f\n",
-                                  millis(), lastAbs.r, lastAbs.g, lastAbs.b);
-                    if (isnan(lastRatio) || isnan(lastPh)) {
-                      Serial.printf("[%lu] [MEAS]  Ratio=NAN  pH=NAN (check calibration)\n", millis());
+
+                    Hsv hsv = computeHsv(baseline, sample);
+                    lastHue = hsv.h;
+                    lastSat = hsv.s;
+                    lastVal = hsv.v;
+                    Serial.printf("[%lu] [MEAS]  Abs  R=%.4f G=%.4f B=%.4f  (ratio=%.4f)\n",
+                                  millis(), lastAbs.r, lastAbs.g, lastAbs.b, lastRatio);
+                    Serial.printf("[%lu] [MEAS]  HSV  H=%.1f S=%.3f V=%.3f\n",
+                                  millis(), lastHue, lastSat, lastVal);
+
+                    if (isnan(hsv.h) || hsv.s < MIN_VALID_SATURATION || hsv.v < MIN_VALID_VALUE) {
+                        lastPh = NAN;
+                        lastExtrapolated = false;
+                        Serial.printf("[%lu] [MEAS]  pH=NAN — sample too grey/dark "
+                                      "(S<%.2f or V<%.2f). Check dose/lighting.\n",
+                                      millis(), MIN_VALID_SATURATION, MIN_VALID_VALUE);
                     } else {
-                      Serial.printf("[%lu] [MEAS]  Ratio=%.4f  pH=%.2f\n",
-                                    millis(), lastRatio, lastPh);
+                        float uh = unwrapHue(hsv.h);
+                        bool extrap = false;
+                        lastPh = hueToPh(uh, extrap);
+                        lastExtrapolated = extrap;
+                        if (isnan(lastPh)) {
+                          Serial.printf("[%lu] [MEAS]  pH=NAN (check calibration table)\n", millis());
+                        } else {
+                          Serial.printf("[%lu] [MEAS]  pH=%.2f%s\n", millis(), lastPh,
+                                        extrap ? " (EXTRAPOLATED — outside calibrated span)" : "");
+                        }
                     }
                 }
 
@@ -933,10 +1270,16 @@ void setup() {
     // ---- Configuration Summary ----
     Serial.println("--------------------------------------------");
     Serial.printf("[CFG]    Base fill:    %u s\n",  baseFillMs / 1000);
+    Serial.printf("[CFG]    Dose:         %u ms\n", doseMs);
     Serial.printf("[CFG]    Drain duty:   %u %%\n", drainDutyPercent);
-    Serial.printf("[CFG]    Cal pH4:      %.3f\n",  CAL_RATIO_PH4);
-    Serial.printf("[CFG]    Cal pH5.5:    %.3f\n",  CAL_RATIO_PH55);
-    Serial.printf("[CFG]    Cal pH7:      %.3f\n",  CAL_RATIO_PH7);
+    Serial.printf("[CFG]    Hue branch:   %.1f deg\n", hueBranchCut);
+    Serial.printf("[CFG]    Cal points:   %u  (pH %.2f-%.2f)\n",
+                  calCount,
+                  calCount > 0 ? calPoints[0].ph : NAN,
+                  calCount > 0 ? calPoints[calCount - 1].ph : NAN);
+    for (uint8_t i = 0; i < calCount; i++) {
+      Serial.printf("[CFG]      pH %.2f -> hue %.1f\n", calPoints[i].ph, calPoints[i].hue);
+    }
     Serial.printf("[CFG]    LCD 1602:     %s\n",    lcdPresent ? "present" : "not found");
     Serial.println("--------------------------------------------");
     Serial.printf("[%lu] System ready. Waiting for START button or WebSocket 'start'.\n", millis());

@@ -267,6 +267,48 @@ header {
   font-size: 12px;
   color: var(--muted);
 }
+.badge {
+  align-self: center;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 600;
+  color: #a4632a;
+  background: rgba(242, 162, 58, 0.18);
+  border: 1px solid rgba(242, 162, 58, 0.5);
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.calpanel {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(255,255,255,0.5);
+  display: grid;
+  gap: 10px;
+}
+.calpanel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.caltable {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.calchip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,0.8);
+}
+.calchip .ph { color: var(--accent); }
+.calchip .hue { color: var(--muted); font-weight: 500; }
+.calchip.empty { color: var(--muted); font-weight: 500; border-style: dashed; }
 @keyframes rise {
   from { transform: translateY(10px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
@@ -292,6 +334,7 @@ header {
       <div class="ph">
         <div id="phValue" class="value">--.--</div>
         <div class="unit">pH</div>
+        <div id="extrapBadge" class="badge" hidden>extrapolated</div>
       </div>
       <div class="state">
         <div class="label">Current Process</div>
@@ -309,14 +352,38 @@ header {
         <div id="baseFillHint" class="config-hint">--</div>
       </div>
       <div class="config-row">
-        <label class="config-label" for="calPh4Input">Cal pH 4</label>
-        <input id="calPh4Input" class="config-input" type="number" step="0.001" value="1.600"/>
-        <label class="config-label" for="calPh55Input">Cal pH 5.5</label>
-        <input id="calPh55Input" class="config-input" type="number" step="0.001" value="1.100"/>
-        <label class="config-label" for="calPh7Input">Cal pH 7</label>
-        <input id="calPh7Input" class="config-input" type="number" step="0.001" value="0.700"/>
-        <button id="calApply" class="config-button" type="button">Save Cal</button>
-        <div id="calHint" class="config-hint">--</div>
+        <label class="config-label" for="doseInput">Dye Dose (ms)</label>
+        <input id="doseInput" class="config-input" type="number" min="200" max="8000" step="50" value="2700"/>
+        <button id="doseApply" class="config-button" type="button">Apply</button>
+        <div id="doseHint" class="config-hint">--</div>
+      </div>
+
+      <div class="calpanel">
+        <div class="calpanel-head">
+          <div class="config-label">Hue → pH Calibration</div>
+          <div id="calSpan" class="config-hint">--</div>
+        </div>
+
+        <div class="config-row">
+          <label class="config-label" for="calCapturePh">Capture buffer pH</label>
+          <input id="calCapturePh" class="config-input" type="number" step="0.01" placeholder="e.g. 6.86"/>
+          <button id="calCaptureBtn" class="config-button" type="button">Capture live hue</button>
+          <div id="calCaptureHint" class="config-hint">Run a cycle with the buffer in the cell, then capture.</div>
+        </div>
+
+        <div id="calTable" class="caltable"></div>
+
+        <div class="config-row">
+          <label class="config-label" for="calPointsInput">Points (pH:hue,…)</label>
+          <input id="calPointsInput" class="config-input" style="width: 240px;" type="text" placeholder="4.01:35,6.86:95,9.18:180"/>
+          <button id="calPointsApply" class="config-button" type="button">Save table</button>
+        </div>
+        <div class="config-row">
+          <label class="config-label" for="hueCutInput">Hue branch cut (°)</label>
+          <input id="hueCutInput" class="config-input" type="number" min="1" max="360" step="1" value="320"/>
+          <button id="hueCutApply" class="config-button" type="button">Apply</button>
+          <div id="calHint" class="config-hint">--</div>
+        </div>
       </div>
       <div class="progress"><span id="progressBar"></span></div>
       <div class="metrics">
@@ -325,12 +392,26 @@ header {
           <div id="progressPct" class="v">0%</div>
         </div>
         <div class="metric">
-          <div class="k">Ratio</div>
+          <div class="k">Hue (°)</div>
+          <div id="hueValue" class="v">--</div>
+        </div>
+        <div class="metric">
+          <div class="k">Sat / Val</div>
+          <div id="svValue" class="v">--</div>
+        </div>
+      </div>
+      <div class="metrics" style="margin-top: 12px;">
+        <div class="metric">
+          <div class="k">Ratio (diag)</div>
           <div id="ratioValue" class="v">--</div>
         </div>
         <div class="metric">
-          <div class="k">Absorbance B/G</div>
+          <div class="k">Absorbance R/G/B</div>
           <div id="absValue" class="v">--</div>
+        </div>
+        <div class="metric">
+          <div class="k">Dye Dose</div>
+          <div id="doseValue" class="v">--</div>
         </div>
       </div>
     </section>
@@ -387,10 +468,18 @@ let lastStatus = null;
 const baseFillInput = document.getElementById("baseFillInput");
 const baseFillApply = document.getElementById("baseFillApply");
 const baseFillHint = document.getElementById("baseFillHint");
-const calPh4Input = document.getElementById("calPh4Input");
-const calPh55Input = document.getElementById("calPh55Input");
-const calPh7Input = document.getElementById("calPh7Input");
-const calApply = document.getElementById("calApply");
+const doseInput = document.getElementById("doseInput");
+const doseApply = document.getElementById("doseApply");
+const doseHint = document.getElementById("doseHint");
+const calCapturePh = document.getElementById("calCapturePh");
+const calCaptureBtn = document.getElementById("calCaptureBtn");
+const calCaptureHint = document.getElementById("calCaptureHint");
+const calTable = document.getElementById("calTable");
+const calSpan = document.getElementById("calSpan");
+const calPointsInput = document.getElementById("calPointsInput");
+const calPointsApply = document.getElementById("calPointsApply");
+const hueCutInput = document.getElementById("hueCutInput");
+const hueCutApply = document.getElementById("hueCutApply");
 const calHint = document.getElementById("calHint");
 
 function connect() {
@@ -437,9 +526,14 @@ function setBaseFillHint(text, isError) {
   baseFillHint.classList.toggle("error", !!isError);
 }
 
-function setCalHint(text, isError) {
-  calHint.textContent = text;
-  calHint.classList.toggle("error", !!isError);
+function setCalHint(el, text, isError) {
+  el.textContent = text;
+  el.classList.toggle("error", !!isError);
+}
+
+function setDoseHint(text, isError) {
+  doseHint.textContent = text;
+  doseHint.classList.toggle("error", !!isError);
 }
 
 function updateBaseFillUI(d) {
@@ -450,17 +544,47 @@ function updateBaseFillUI(d) {
   }
 }
 
+function updateDoseUI(d) {
+  if (!d || typeof d.doseMs !== "number") return;
+  if (document.activeElement !== doseInput) {
+    doseInput.value = Math.round(d.doseMs);
+  }
+  document.getElementById("doseValue").textContent = `${Math.round(d.doseMs)} ms`;
+}
+
 function updateCalibrationUI(d) {
   if (!d || !d.calibration) return;
   const cal = d.calibration;
-  if (typeof cal.ph4 === "number" && document.activeElement !== calPh4Input) {
-    calPh4Input.value = Number(cal.ph4).toFixed(3);
+  const points = Array.isArray(cal.points) ? cal.points : [];
+
+  calTable.innerHTML = "";
+  if (points.length === 0) {
+    const chip = document.createElement("div");
+    chip.className = "calchip empty";
+    chip.textContent = "No calibration points";
+    calTable.appendChild(chip);
+  } else {
+    points.forEach((p) => {
+      const chip = document.createElement("div");
+      chip.className = "calchip";
+      chip.innerHTML = `<span class="ph">pH ${Number(p.ph).toFixed(2)}</span> <span class="hue">${Number(p.hue).toFixed(1)}°</span>`;
+      calTable.appendChild(chip);
+    });
   }
-  if (typeof cal.ph55 === "number" && document.activeElement !== calPh55Input) {
-    calPh55Input.value = Number(cal.ph55).toFixed(3);
+
+  if (typeof cal.phMin === "number" && typeof cal.phMax === "number") {
+    calSpan.textContent = `${points.length} pts · calibrated pH ${Number(cal.phMin).toFixed(2)}–${Number(cal.phMax).toFixed(2)}`;
+  } else {
+    calSpan.textContent = `${points.length} pts`;
   }
-  if (typeof cal.ph7 === "number" && document.activeElement !== calPh7Input) {
-    calPh7Input.value = Number(cal.ph7).toFixed(3);
+
+  if (document.activeElement !== calPointsInput) {
+    calPointsInput.value = points
+      .map((p) => `${Number(p.ph).toFixed(2)}:${Number(p.hue).toFixed(1)}`)
+      .join(",");
+  }
+  if (typeof cal.hueBranchCut === "number" && document.activeElement !== hueCutInput) {
+    hueCutInput.value = Math.round(cal.hueBranchCut);
   }
 }
 
@@ -496,37 +620,89 @@ function applyBaseFill() {
     });
 }
 
-function applyCalibration() {
-  const ph4 = Number.parseFloat(calPh4Input.value);
-  const ph55 = Number.parseFloat(calPh55Input.value);
-  const ph7 = Number.parseFloat(calPh7Input.value);
-
-  if (![ph4, ph55, ph7].every(Number.isFinite)) {
-    setCalHint("Enter three numbers", true);
+function applyDose() {
+  const raw = parseInt(doseInput.value, 10);
+  if (!Number.isFinite(raw)) {
+    setDoseHint("Enter a number", true);
     return;
   }
+  const clamped = Math.min(8000, Math.max(200, raw));
+  if (clamped !== raw) doseInput.value = clamped;
+  setDoseHint("Applying...", false);
+  fetch(`/api/config?doseMs=${clamped}`)
+    .then((res) => { if (!res.ok) throw new Error("Request failed"); return res.json(); })
+    .then((payload) => {
+      const ms = payload && typeof payload.doseMs === "number" ? Math.round(payload.doseMs) : clamped;
+      doseInput.value = ms;
+      setDoseHint(`Saved ${ms} ms`, false);
+    })
+    .catch(() => setDoseHint("Failed to update", true));
+}
 
-  setCalHint("Saving...", false);
-  fetch(`/api/calibrate?ph4Ratio=${encodeURIComponent(ph4)}&ph55Ratio=${encodeURIComponent(ph55)}&ph7Ratio=${encodeURIComponent(ph7)}`)
+function applyCalibrationPoints() {
+  const raw = (calPointsInput.value || "").trim();
+  if (!raw) {
+    setCalHint(calHint, "Enter points as pH:hue,…", true);
+    return;
+  }
+  setCalHint(calHint, "Saving...", false);
+  fetch(`/api/calibrate?points=${encodeURIComponent(raw)}`)
     .then((res) => {
       if (!res.ok) {
-        return res.json().then((payload) => {
-          throw new Error(payload && payload.error ? payload.error : "Request failed");
-        });
+        return res.json().then((p) => { throw new Error(p && p.error ? p.error : "Request failed"); });
       }
       return res.json();
     })
     .then((payload) => {
-      if (payload && payload.calibration) {
-        updateCalibrationUI(payload);
-        setCalHint("Calibration saved", false);
-      } else {
-        setCalHint("Calibration saved", false);
-      }
+      if (payload && payload.calibration) updateCalibrationUI(payload);
+      setCalHint(calHint, "Calibration saved", false);
     })
-    .catch((error) => {
-      setCalHint(error.message || "Failed to update", true);
-    });
+    .catch((error) => setCalHint(calHint, error.message || "Failed to update", true));
+}
+
+function captureCalibration() {
+  const ph = Number.parseFloat(calCapturePh.value);
+  if (!Number.isFinite(ph)) {
+    setCalHint(calCaptureHint, "Enter the buffer pH", true);
+    return;
+  }
+  setCalHint(calCaptureHint, "Capturing live hue...", false);
+  fetch(`/api/calibrate/capture?ph=${encodeURIComponent(ph)}`)
+    .then((res) => {
+      if (!res.ok) {
+        return res.json().then((p) => { throw new Error(p && p.error ? p.error : "Request failed"); });
+      }
+      return res.json();
+    })
+    .then((payload) => {
+      if (payload && payload.calibration) updateCalibrationUI(payload);
+      const hue = payload && typeof payload.capturedHue === "number" ? ` (hue ${Number(payload.capturedHue).toFixed(1)}°)` : "";
+      setCalHint(calCaptureHint, `Captured pH ${ph.toFixed(2)}${hue}`, false);
+    })
+    .catch((error) => setCalHint(calCaptureHint, error.message || "Capture failed", true));
+}
+
+function applyHueCut() {
+  const raw = Number.parseFloat(hueCutInput.value);
+  if (!Number.isFinite(raw)) {
+    setCalHint(calHint, "Enter a number", true);
+    return;
+  }
+  const clamped = Math.min(360, Math.max(1, raw));
+  if (clamped !== raw) hueCutInput.value = clamped;
+  setCalHint(calHint, "Applying...", false);
+  fetch(`/api/calibrate?hueCut=${encodeURIComponent(clamped)}`)
+    .then((res) => {
+      if (!res.ok) {
+        return res.json().then((p) => { throw new Error(p && p.error ? p.error : "Request failed"); });
+      }
+      return res.json();
+    })
+    .then((payload) => {
+      if (payload && payload.calibration) updateCalibrationUI(payload);
+      setCalHint(calHint, `Branch cut ${clamped}°`, false);
+    })
+    .catch((error) => setCalHint(calHint, error.message || "Failed to update", true));
 }
 
 function updateStartButton(d) {
@@ -556,17 +732,30 @@ function updateUI(d) {
   document.getElementById("phValue").textContent = fmtNumber(d.ph, 2);
   document.getElementById("stateName").textContent = d.state || "--";
   document.getElementById("stateAction").textContent = d.action || "--";
+
+  const badge = document.getElementById("extrapBadge");
+  badge.hidden = !(d.extrapolated && d.ph !== null && d.ph !== undefined);
+
   updateBaseFillUI(d);
+  updateDoseUI(d);
   updateCalibrationUI(d);
 
   const progress = Math.min(1, Math.max(0, d.progress || 0));
   document.getElementById("progressBar").style.width = `${(progress * 100).toFixed(1)}%`;
   document.getElementById("progressPct").textContent = `${Math.round(progress * 100)}%`;
+
+  const hsv = d.hsv || {};
+  document.getElementById("hueValue").textContent = fmtNumber(hsv.h, 1);
+  const s = hsv.s === null || hsv.s === undefined ? null : hsv.s;
+  const v = hsv.v === null || hsv.v === undefined ? null : hsv.v;
+  document.getElementById("svValue").textContent =
+    (s === null && v === null) ? "--" : `${fmtNumber(s, 2)} / ${fmtNumber(v, 2)}`;
+
   document.getElementById("ratioValue").textContent = fmtNumber(d.ratio, 3);
 
   if (d.absorbance) {
-    const bg = `${fmtNumber(d.absorbance.b, 3)}/${fmtNumber(d.absorbance.g, 3)}`;
-    document.getElementById("absValue").textContent = bg;
+    const rgb = `${fmtNumber(d.absorbance.r, 2)}/${fmtNumber(d.absorbance.g, 2)}/${fmtNumber(d.absorbance.b, 2)}`;
+    document.getElementById("absValue").textContent = rgb;
   }
 
   if (d.baselineValid) {
@@ -605,21 +794,27 @@ document.getElementById("startBtn").addEventListener("click", () => {
 
 baseFillApply.addEventListener("click", applyBaseFill);
 baseFillInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    applyBaseFill();
-  }
+  if (event.key === "Enter") applyBaseFill();
 });
-calApply.addEventListener("click", applyCalibration);
-[
-  calPh4Input,
-  calPh55Input,
-  calPh7Input,
-].forEach((input) => {
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      applyCalibration();
-    }
-  });
+
+doseApply.addEventListener("click", applyDose);
+doseInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") applyDose();
+});
+
+calPointsApply.addEventListener("click", applyCalibrationPoints);
+calPointsInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") applyCalibrationPoints();
+});
+
+calCaptureBtn.addEventListener("click", captureCalibration);
+calCapturePh.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") captureCalibration();
+});
+
+hueCutApply.addEventListener("click", applyHueCut);
+hueCutInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") applyHueCut();
 });
 </script>
 </body>
