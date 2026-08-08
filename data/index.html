@@ -379,7 +379,7 @@ header {
       </div>
       <div class="config-row">
         <label class="config-label" for="rinseCyclesInput">Rinse (auto-passes)</label>
-        <input id="rinseCyclesInput" class="config-input" type="number" min="0" max="5" step="1" value="1"/>
+        <input id="rinseCyclesInput" class="config-input" type="number" min="0" max="5" step="1" value="0"/>
         <button id="rinseApply" class="config-button" type="button">Apply</button>
         <button id="rinseNowBtn" class="config-button" type="button">Rinse now</button>
         <div id="rinseHint" class="config-hint">Flushes dye carryover after each run. 0 disables the auto-rinse.</div>
@@ -629,7 +629,7 @@ function runPrime(pump) {
     });
 }
 
-// Reflect the stored auto-rinse count, and disable the manual trigger while a
+// Reflect the stored rinse settings, and disable the manual trigger while a
 // cycle (or a rinse) is running so it can only fire from idle.
 function updateRinseUI(d) {
   if (!d) return;
@@ -657,8 +657,8 @@ function applyRinseCycles() {
       const n = payload && typeof payload.rinseCycles === "number" ? payload.rinseCycles : cycles;
       rinseCyclesInput.value = n;
       rinseHint.textContent = n === 0
-        ? "Auto-rinse off. Dye carryover may tint the next baseline."
-        : `Auto-rinse: ${n} pass${n === 1 ? "" : "es"} after each run.`;
+        ? 'Auto-rinse off: cycle ends without rinsing. Use "Rinse now" before a reading you want to trust.'
+        : `Auto-rinse on: ${n} pass${n === 1 ? "" : "es"} after each reading.`;
     })
     .catch((err) => {
       rinseHint.textContent = err.message || "Save failed";

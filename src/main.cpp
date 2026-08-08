@@ -104,6 +104,11 @@ static constexpr uint32_t pump2Ms(float ml) {
                             ((ml - PUMP2_KICK_ML) / PUMP2_ML_PER_S) * 1000.0f +
                             0.5f);
 }
+// Time for EITHER peristaltic head to move a volume at 100% duty. Both pumps are
+// the same NKP unit, so this is just pump1Ms under a name that does not imply
+// pump 1. Priming drives pump 2 through pump2Full() at 100% — NOT the 35%
+// metering duty — so a dye prime must be timed with this, not with pump2Ms().
+static constexpr uint32_t pumpFullMs(float ml) { return pump1Ms(ml); }
 
 // ----- Timing (ms) -----
 // Geometry predicts pump1Ms(15.65 mL) = 25378 ms at the nominal 0.6167 mL/s.
@@ -157,12 +162,22 @@ static uint32_t doseMs = DOSE_MS_DEFAULT;
 
 // ----- Prime -----
 // Fills a pump's line from source to outlet so dead volume stops being a guess.
-// 15% overshoot pushes a little fluid past the outlet, guaranteeing the tube is
-// wet end-to-end rather than stopping with an air gap at the tip. Prime with the
-// cell empty and drain afterwards — the overshoot lands in the chamber.
-static constexpr float PRIME_OVERSHOOT = 1.15f;
-static const uint32_t PRIME_DYE_MS_DEFAULT   = pump2Ms(P2_LINE_ML * PRIME_OVERSHOOT);
-static const uint32_t PRIME_WATER_MS_DEFAULT = pump1Ms(P1_LINE_ML * PRIME_OVERSHOOT);
+//
+// Sized at 2x the line volume, not 1x: the first line-volume fills the tube, the
+// second sweeps through it and pushes trapped air out of the tip. A bare 1.15x
+// "fill plus a splash" leaves bubbles parked in the line, and a bubble in the dye
+// path displaces liquid the dose is counting on, so the shot comes up short.
+// Prime with the cell empty and drain afterwards — the overshoot lands there.
+//
+// TIMING MODEL — the reason these numbers changed. setState(PRIME) drives the dye
+// pump with pump2Full(), i.e. 100% duty, but the old default was computed with
+// pump2Ms(), which models the 35% metering duty. Real flow was therefore 2.86x
+// the assumed rate and a "1.46 mL" dye prime actually pushed ~3.89 mL of neat
+// reagent into the cell. Both primes now use pumpFullMs() so the duration matches
+// the duty the pump is really given.
+static constexpr float PRIME_OVERSHOOT = 2.0f;
+static const uint32_t PRIME_DYE_MS_DEFAULT   = pumpFullMs(P2_LINE_ML * PRIME_OVERSHOOT);
+static const uint32_t PRIME_WATER_MS_DEFAULT = pumpFullMs(P1_LINE_ML * PRIME_OVERSHOOT);
 static const uint32_t PRIME_MS_MIN = 200;
 static const uint32_t PRIME_MS_MAX = 20000;
 static uint32_t primeMs = PRIME_DYE_MS_DEFAULT;  // duration of the active prime
@@ -185,20 +200,24 @@ static const uint32_t COOL_DOWN_MS = 10000;
 // optical windows, and pump 3's 0.85 mL inlet. Left there it tints the next
 // BLANKING baseline, and because every reading is measured against that baseline
 // the whole cycle drifts. A rinse pass fills the cell with clean sample water and
-// drains again, diluting the residue ~15-25x per pass and pushing fresh water
-// through the drain line. rinseCycles passes run automatically after the
-// measurement drain (0 disables the auto-rinse); a rinse can also be triggered
-// manually from idle via /api/rinse.
+// drains again, diluting the residue and pushing fresh water through the drain
+// line.
 //
-// The rinse fills to the FULL operating level and drains for the full DRAIN_MS so
-// the whole wetted zone — including the dye tidemark that forms at the top of the
-// measurement fill — gets washed and the cell comes out empty. (An earlier build
-// used a 12 mL partial fill + short drain to stay quiet, but that only wet the
-// bottom of the cell, so dye left a ring above the rinse line. Emptying completely
-// matters more than being quiet, so the rinse now mirrors a real fill/drain.)
-static const uint8_t  RINSE_CYCLES_DEFAULT = 1;
+// rinseCycles is the single rinse control: 0 disables the automatic post-cycle
+// rinse (the default — a finished cycle stops at COOL_DOWN and leaves rinsing to
+// you via /api/rinse / the "Rinse now" button), while 1..MAX runs that many passes
+// automatically after every successful measurement drain. Trade-off at 0: dye
+// carryover stays in the cell between runs and tints the next baseline, so rinse
+// before a reading you intend to trust.
+//
+// The rinse mirrors a real fill/drain — full operating level, full DRAIN_MS — so
+// the wash covers the entire wetted zone (walls, windows, and the dye tidemark at
+// the top of the fill line) and the cell comes out empty. (An earlier build used a
+// 12 mL partial fill + short drain to stay quiet, but that only wet the bottom of
+// the cell, so dye left a ring above the rinse line.)
+static const uint8_t  RINSE_CYCLES_DEFAULT = 0;       // 0 = no automatic rinse
 static const uint8_t  RINSE_CYCLES_MAX = 5;
-static uint8_t rinseCycles    = RINSE_CYCLES_DEFAULT; // 0 = no automatic rinse
+static uint8_t rinseCycles    = RINSE_CYCLES_DEFAULT; // auto passes; 0 disables
 static uint8_t rinseRemaining = 0;                    // passes left in the active rinse
 
 // Fill to the same 15.65 mL operating level a measurement uses, so the rinse
@@ -1203,9 +1222,10 @@ static void setupServer() {
     });
 
     // Fill a supply line so dead volume is known rather than guessed.
-    //   GET /api/prime?pump=dye|water[&ms=6300]
-    // Defaults come from the measured tube lengths plus a 15% overshoot. Run
-    // with the cell empty and drain afterwards — the overshoot lands inside.
+    //   GET /api/prime?pump=dye|water[&ms=4127]
+    // Defaults come from the measured tube lengths at 2x line volume, so the
+    // second pass sweeps trapped air out of the tip. Run with the cell empty and
+    // drain afterwards — the overshoot lands inside.
     server.on("/api/prime", HTTP_GET, [](AsyncWebServerRequest *request) {
       bool useDye = true;
       if (request->hasParam("pump")) {
@@ -1467,9 +1487,11 @@ static void runStateMachine() {
                     }
                 }
 
-                // A clean reading just completed — queue the post-cycle rinse so
-                // DRAIN hands off to it instead of COOL_DOWN. Sensor-error paths
-                // above drain directly and leave rinseRemaining at 0 (no rinse).
+                // A clean reading just completed. Queue rinseCycles automatic
+                // rinse passes — 0 means no auto-rinse, so the cycle ends at
+                // COOL_DOWN and rinsing is left to the manual "Rinse now" button.
+                // Sensor-error paths above drain directly and leave rinseRemaining
+                // at 0 regardless.
                 rinseRemaining = rinseCycles;
                 setState(ProcessState::DRAIN);
             }
@@ -1651,10 +1673,16 @@ void setup() {
                   doseMs, DYE_DOSE_ML);
     Serial.printf("[CFG]    Dye line:     %.2f mL  prime %u ms\n",
                   P2_LINE_ML, PRIME_DYE_MS_DEFAULT);
+    Serial.printf("[CFG]    Water line:   %.2f mL  prime %u ms\n",
+                  P1_LINE_ML, PRIME_WATER_MS_DEFAULT);
     Serial.printf("[CFG]    Dye primed:   %s\n", dyeLinePrimed ? "yes" : "NO - run /api/prime?pump=dye");
     Serial.printf("[CFG]    Drain duty:   %u %%\n", drainDutyPercent);
-    Serial.printf("[CFG]    Rinse:        %u cycle(s), fill %u ms (%.2f mL)\n",
-                  rinseCycles, rinseFillMs, rinseFillMs * PUMP_ML_PER_S / 1000.0f);
+    if (rinseCycles == 0) {
+      Serial.println("[CFG]    Rinse:        auto OFF - rinse manually via /api/rinse");
+    } else {
+      Serial.printf("[CFG]    Rinse:        %u auto cycle(s), fill %u ms (%.2f mL)\n",
+                    rinseCycles, rinseFillMs, rinseFillMs * PUMP_ML_PER_S / 1000.0f);
+    }
     Serial.printf("[CFG]    Hue branch:   %.1f deg\n", hueBranchCut);
     Serial.printf("[CFG]    Cal points:   %u  (pH %.2f-%.2f)\n",
                   calCount,
