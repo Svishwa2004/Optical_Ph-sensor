@@ -1,6 +1,6 @@
 # Optical pH Sensor (ESP32)
 
-ESP32 firmware and web UI for a color-based optical pH sensor. The system runs a timed process (fill, blanking, dosing, mixing, diffusion, measurement, drain, cooldown) and reports status plus readings over a web dashboard served from LittleFS.
+ESP32 firmware and web UI for a color-based optical pH sensor. The system runs a timed process (fill, blanking, dosing, mixing, diffusion, measurement, drain, rinse, cooldown) and reports status plus readings over a web dashboard served from LittleFS.
 
 ## Features
 - Manual-start process cycle from the web UI
@@ -75,13 +75,18 @@ If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry bloc
 [src/main.cpp](src/main.cpp); every duration recomputes at compile time.
 
 ## API
-- `GET /api/config?baseFillSec=...&baseFillMs=...&drainDuty=...&doseMs=...` updates fill, drain,
-  and dye-dose duration (ms, clamped 200–8000) and saves them to NVS. Prefer `baseFillMs`:
-  one second of fill is 0.617 mL, which is 3.6% of the cell and too coarse to land on target.
-  `baseFillMs` wins if both are supplied.
+- `GET /api/config?baseFillSec=...&baseFillMs=...&drainDuty=...&doseMs=...&rinseCycles=...&rinseFillMs=...`
+  updates fill, drain, and dye-dose duration (ms, clamped 200–8000), the number of automatic
+  post-cycle rinse passes (0–5), and the rinse fill time (ms), and saves them to NVS. Prefer
+  `baseFillMs`: one second of fill is 0.617 mL, which is 3.6% of the cell and too coarse to land on
+  target. `baseFillMs` wins if both are supplied.
 - `GET /api/prime?pump=dye|water[&ms=...]` runs a supply pump to fill its line, so dead volume is
   known rather than assumed. Defaults cover the measured line plus 15% overshoot (dye 6300 ms,
   water 7000 ms). Only allowed from idle (409 otherwise); run with the cell empty and drain after.
+- `GET /api/rinse[&cycles=N]` flushes the cell with clean water to clear dye carryover before the
+  next run: N fill+drain passes (default `rinseCycles`, min 1), then cool down. Only allowed from
+  idle (409 otherwise). This is the manual twin of the automatic rinse that already follows every
+  successful measurement.
 - `GET /api/calibrate?points=pH:hue,pH:hue,...` replaces the whole hue→pH table (2–8 points,
   pH and hue both strictly ascending). Optional `&hueCut=<deg>` sets the hue branch cut
   (wrap point for the circular hue scale; default 320°).
@@ -117,10 +122,33 @@ If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry bloc
    that span the status reports `extrapolated: true`. Add buffers (up to 8 points) to widen the
    trustworthy range.
 
+## Residual liquid between runs
+After a cycle, the two supply lines hold leftover liquid, but they are not the same problem.
+
+Pump 1's line stays full of clean sample water and that is intentional. The peristaltic head
+pinches the tube shut when idle, so the primed column holds. `BASE_FILL` actually depends on it:
+if the line drained, the first ~0.85 mL of the next fill would re-wet the tube instead of the cell.
+So the line is left charged — re-prime with `/api/prime?pump=water` only after a reservoir swap,
+tube change, or long idle. Do not try to empty it.
+
+Pump 3 is the line that matters. Its inlet holds ~0.85 mL of dyed water and the cell walls keep a
+tinted film; left there, that residue corrupts the next `BLANKING` baseline and every reading drifts
+with it. Its 46 cm / 3.25 mL outlet can also siphon dyed waste back toward the cell if it does not
+run downhill. Both are handled by the post-cycle rinse: after a successful measurement drains, the
+firmware runs `rinseCycles` fill+drain passes (default 1) that fill the cell to the full operating
+level and drain it completely. The rinse deliberately mirrors a real fill/drain — full 15.65 mL fill,
+full 6 s drain — so the wash covers the entire wetted zone (walls, windows, and the dye tidemark at
+the top of the fill line) and the cell comes out empty rather than leaving a ring above a partial
+rinse. Trigger it manually from idle with `/api/rinse`, or set `rinseCycles=0` to disable the
+automatic rinse (not recommended: dye carryover will tint the baseline). Still route pump 3's outlet
+downhill or give it an air break; the rinse reduces siphon-back but is not a substitute for gravity.
+
 ## Notes
 - The calibration table is empty/placeholder until you capture your own buffers.
 - `dyeLinePrimed` resets to false on every boot by design — the firmware cannot know whether the
   line drained while powered down.
+- The automatic post-cycle rinse only runs after a clean measurement. Sensor-error and aborted
+  cycles drain directly to cool-down without rinsing (`rinseRemaining` stays 0).
 - Two stale NVS values are discarded on load: a 33000 ms base fill (never bench-verified, delivers
   20.35 mL and overfills past the 17.09 mL cap) and a 2700 ms dose (derived from an assumed 49.5 mm
   dead-volume segment rather than the measured 10 cm outlet). Both fall back to the derived default.

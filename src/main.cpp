@@ -188,28 +188,33 @@ static const uint32_t COOL_DOWN_MS = 10000;
 // drains again, diluting the residue ~15-25x per pass and pushing fresh water
 // through the drain line. rinseCycles passes run automatically after the
 // measurement drain (0 disables the auto-rinse); a rinse can also be triggered
-// manually from idle via /api/rinse. It is kept deliberately short: a partial
-// fill (not the full operating volume) plus a shortened drain make it quick and
-// keep the noisy R385 running only briefly.
+// manually from idle via /api/rinse.
+//
+// The rinse fills to the FULL operating level and drains for the full DRAIN_MS so
+// the whole wetted zone — including the dye tidemark that forms at the top of the
+// measurement fill — gets washed and the cell comes out empty. (An earlier build
+// used a 12 mL partial fill + short drain to stay quiet, but that only wet the
+// bottom of the cell, so dye left a ring above the rinse line. Emptying completely
+// matters more than being quiet, so the rinse now mirrors a real fill/drain.)
 static const uint8_t  RINSE_CYCLES_DEFAULT = 1;
 static const uint8_t  RINSE_CYCLES_MAX = 5;
 static uint8_t rinseCycles    = RINSE_CYCLES_DEFAULT; // 0 = no automatic rinse
 static uint8_t rinseRemaining = 0;                    // passes left in the active rinse
 
-// Fill only enough to submerge the optical windows and dilute what clings to
-// them — the rinse targets carryover, not measurement, so it needn't reach the
-// full 15.65 mL operating level. BENCH-VERIFY this crests the windows; if a film
-// is left above the rinse line, raise rinseFillMs. 12 mL at nominal is ~19.5 s.
-static constexpr float RINSE_FILL_ML = 12.0f;
+// Fill to the same 15.65 mL operating level a measurement uses, so the rinse
+// covers the entire wetted zone (walls, optical windows, and the top-of-fill dye
+// tidemark). BENCH-VERIFY it crests the windows; adjust rinseFillMs if the level
+// lands low. 15.65 mL at nominal is ~25 s.
+static constexpr float RINSE_FILL_ML = BASE_FILL_ML;  // full operating level (15.65 mL)
 static const uint32_t RINSE_FILL_MS_DEFAULT = pump1Ms(RINSE_FILL_ML);
 static const uint32_t RINSE_FILL_MS_MIN = 2000;
 static const uint32_t RINSE_FILL_MS_MAX = 60000;
 static uint32_t rinseFillMs = RINSE_FILL_MS_DEFAULT;
 
-// Shorter than the measurement DRAIN_MS: a rinse doesn't need the long air-purge
-// tail, so it stays quick and the R385 runs for less time. The pump clears the
-// 12 mL charge plus the 4.10 mL line in ~1.2 s, leaving an ample purge margin.
-static const uint32_t RINSE_DRAIN_MS = 4000;
+// Full drain, same as the measurement DRAIN_MS: clears the ~15.65 mL charge plus
+// the 4.10 mL drain line in ~1.6 s, and the remaining air-purge tail strips
+// droplets off the floor and empties pump 3's outlet so nothing is left behind.
+static const uint32_t RINSE_DRAIN_MS = DRAIN_MS;
 
 static const uint32_t IDLE_MS = 3600000;
 static const uint8_t SENSOR_ZERO_RETRY_COUNT = 3;
