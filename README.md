@@ -81,14 +81,19 @@ If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry bloc
   (ms), and saves them to NVS. Prefer `baseFillMs`: one second of fill is 0.617 mL, which is 3.6% of
   the cell and too coarse to land on target. `baseFillMs` wins if both are supplied.
 - `GET /api/prime?pump=dye|water[&ms=...]` runs a supply pump to fill its line, so dead volume is
-  known rather than assumed. Defaults push 2× the measured line volume (dye 4127 ms, water 11692 ms)
-  so the second pass sweeps trapped air out of the tip. Only allowed from idle (409 otherwise); run
-  with the cell empty and drain after.
+  known rather than assumed. The overshoot past one line-volume is what sweeps trapped air out of
+  the tip; water gets 2× (11692 ms, 7.21 mL) and the dye gets 1.5× (3095 ms, 1.91 mL), the reagent
+  being the expensive one. Only allowed from idle (409 otherwise); run with the cell empty and
+  drain after.
 - `GET /api/rinse[&cycles=N]` flushes the cell with clean water to clear dye carryover before the
   next run: N fill+drain passes (default `rinseCycles`, but always at least 1 pass even when the
   auto-rinse is disabled), then cool down. Only allowed from idle (409 otherwise). This is the manual
   rinse, and it is the default way to rinse — the automatic post-cycle rinse is opt-in by setting
   `rinseCycles` to 1 or more.
+- `GET /api/purge` swaps the liquid under test without spending a full rinse pass: it pushes 7.21 mL
+  (2× pump 1's line volume) through the line and cell, then drains. Run it right after moving pump
+  1's intake into a new sample, otherwise the previous sample leads the next fill (see "Carryover"
+  below). 11692 ms + a 6 s drain, versus 25378 ms + 6 s for a rinse pass. Idle only.
 - `GET /api/calibrate?points=pH:hue,pH:hue,...` replaces the whole hue→pH table (2–8 points,
   pH and hue both strictly ascending). Optional `&hueCut=<deg>` sets the hue branch cut
   (wrap point for the circular hue scale; default 320°).
@@ -102,10 +107,12 @@ If you re-measure a tube, edit the `*_CM` constants in the fluidic geometry bloc
 
 ## Bench calibration & dosing procedure
 1. **Prime both lines.** Call `/api/prime?pump=water` then `/api/prime?pump=dye` with the cell
-   empty, then run a drain to clear the overshoot. Each prime pushes 2× the line volume so the
-   second pass sweeps trapped air out of the tip — a bubble left in the dye line displaces liquid
-   the dose is counting on, so the shot lands short. `dyeLinePrimed` goes true and the dashboard
-   warning clears. Re-prime after any reservoir swap, tube change, or long idle period.
+   empty, then run a drain to clear the overshoot. Each prime pushes past one line-volume so the
+   overshoot sweeps trapped air out of the tip — a bubble left in the dye line displaces liquid
+   the dose is counting on, so the shot lands short. Water uses 2× and the dye 1.5×, which is
+   enough for its short 1.272 mL line and keeps 0.64 mL of reagent out of the waste bottle each
+   time. `dyeLinePrimed` goes true and the dashboard warning clears. Re-prime after any reservoir
+   swap, tube change, or long idle period.
 2. **Verify the fill level.** Run a cycle and watch the base fill. The default is 24000 ms (a
    manual override; geometry predicts 25378 ms for 15.65 mL at the nominal 37 mL/min, but the
    pump runs slightly fast). The level should crest the optical windows with headspace to spare.
@@ -150,6 +157,15 @@ many passes run automatically after every successful reading instead; 0 disables
 trade-off if you leave it off: dye carryover stays in the cell between runs and will tint the next
 baseline, so rinse before any reading you intend to trust. Still route pump 3's outlet downhill or
 give it an air break; the rinse reduces siphon-back but is not a substitute for gravity.
+
+**Changing samples is a different problem, and `/api/purge` is the answer.** Pump 1's line being
+charged is a feature within one sample and a liability across two: the 3.605 mL it holds is the
+*previous* liquid, and it leads the next `BASE_FILL` — roughly 24% of the fill is the sample you
+just finished with. A rinse pass does clear it, but at 15.65 mL and 31 s a pass that is expensive
+when you are stepping through several samples or three calibration buffers by hand. The purge is
+the same idea sized to the actual problem: move the intake into the new liquid, push 7.21 mL (one
+line-volume to displace the old sample, one to sweep behind it), drain, and the line and cell now
+hold only the new liquid. Use "Purge (new sample)" on the dashboard, or `/api/purge`.
 
 ## Notes
 - The calibration table is empty/placeholder until you capture your own buffers.

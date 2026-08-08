@@ -9,3 +9,39 @@ in the development cycle.
 
 More information about PlatformIO Unit Testing:
 - https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+
+================================================================================
+Host tests (no hardware, no ESP32 toolchain)
+================================================================================
+
+test/host/ holds two g++ regression tests for the Arduino-independent parts of
+src/main.cpp. They compile and run on any machine with g++ (C++17); you do NOT
+need a board, PlatformIO, or the ESP32 toolchain to run them.
+
+    bash test/host/run_host_tests.sh
+
+What they guard:
+
+  test_fluidics.cpp   - the fluidic geometry, flow rates, and derived timings
+                        (line volumes, base fill, dose, prime/purge/rinse
+                        durations). It does NOT copy the constants: the script
+                        re-extracts the block from src/main.cpp into
+                        geom_block.inc on every run, so the assertions always
+                        check the shipped source. Regression guards live here for
+                        the two bugs already fixed once - the 35%-vs-100% prime
+                        duty error and the 33000 ms overfill - so they cannot
+                        silently come back.
+
+  test_colormath.cpp  - the hue/HSV math, branch-cut unwrapping, hue->pH
+                        interpolation, and calibration-table validate/parse/
+                        upsert logic. These function bodies are MIRRORED from
+                        main.cpp (they pull in Arduino types that will not
+                        compile on the host), so if you change one of those
+                        functions in main.cpp, update its copy here too.
+
+Adding a testable constant: put it in main.cpp BETWEEN the TUBE_ML_PER_CM line
+and the `RINSE_DRAIN_MS = DRAIN_MS;` line - that is the range the extractor
+copies. Anything outside it is invisible to test_fluidics.
+
+The compiled binaries and the generated geom_block.inc are git-ignored.

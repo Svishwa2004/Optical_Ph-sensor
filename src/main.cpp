@@ -163,11 +163,20 @@ static uint32_t doseMs = DOSE_MS_DEFAULT;
 // ----- Prime -----
 // Fills a pump's line from source to outlet so dead volume stops being a guess.
 //
-// Sized at 2x the line volume, not 1x: the first line-volume fills the tube, the
-// second sweeps through it and pushes trapped air out of the tip. A bare 1.15x
-// "fill plus a splash" leaves bubbles parked in the line, and a bubble in the dye
-// path displaces liquid the dose is counting on, so the shot comes up short.
-// Prime with the cell empty and drain afterwards — the overshoot lands there.
+// Sized as a multiple of the line volume, not 1x: the first line-volume fills the
+// tube, the overshoot sweeps through it and pushes trapped air out of the tip. A
+// bare 1.15x "fill plus a splash" leaves bubbles parked in the line, and a bubble
+// in the dye path displaces liquid the dose is counting on, so the shot comes up
+// short. Prime with the cell empty and drain afterwards — the overshoot lands there.
+//
+// The two lines get different overshoots because the sweep costs different money.
+// Water is free and pump 1's line is long (3.605 mL) with the reservoir run to
+// worry about, so it keeps the full 2x = 7.21 mL. The dye is ~45% methanol
+// reagent that has to be bought, handled and disposed of, and its line is short
+// (1.272 mL) with no long uphill run to trap air, so 1.5x = 1.91 mL clears the tip
+// just as well and spends 0.64 mL less reagent every prime. If bubbles ever
+// survive a dye prime, put PRIME_DYE_OVERSHOOT back to 2.0f — do NOT compensate
+// by lengthening the dose, which hides the fault instead of fixing it.
 //
 // TIMING MODEL — the reason these numbers changed. setState(PRIME) drives the dye
 // pump with pump2Full(), i.e. 100% duty, but the old default was computed with
@@ -175,9 +184,10 @@ static uint32_t doseMs = DOSE_MS_DEFAULT;
 // the assumed rate and a "1.46 mL" dye prime actually pushed ~3.89 mL of neat
 // reagent into the cell. Both primes now use pumpFullMs() so the duration matches
 // the duty the pump is really given.
-static constexpr float PRIME_OVERSHOOT = 2.0f;
-static const uint32_t PRIME_DYE_MS_DEFAULT   = pumpFullMs(P2_LINE_ML * PRIME_OVERSHOOT);
-static const uint32_t PRIME_WATER_MS_DEFAULT = pumpFullMs(P1_LINE_ML * PRIME_OVERSHOOT);
+static constexpr float PRIME_DYE_OVERSHOOT   = 1.5f;  // 1.91 mL of reagent
+static constexpr float PRIME_WATER_OVERSHOOT = 2.0f;  // 7.21 mL of water
+static const uint32_t PRIME_DYE_MS_DEFAULT   = pumpFullMs(P2_LINE_ML * PRIME_DYE_OVERSHOOT);
+static const uint32_t PRIME_WATER_MS_DEFAULT = pumpFullMs(P1_LINE_ML * PRIME_WATER_OVERSHOOT);
 static const uint32_t PRIME_MS_MIN = 200;
 static const uint32_t PRIME_MS_MAX = 20000;
 static uint32_t primeMs = PRIME_DYE_MS_DEFAULT;  // duration of the active prime
@@ -230,10 +240,39 @@ static const uint32_t RINSE_FILL_MS_MIN = 2000;
 static const uint32_t RINSE_FILL_MS_MAX = 60000;
 static uint32_t rinseFillMs = RINSE_FILL_MS_DEFAULT;
 
-// Full drain, same as the measurement DRAIN_MS: clears the ~15.65 mL charge plus
+// ----- Sample-changeover purge -----
+// Swapping the liquid under test is the one case a rinse handles badly. Pump 1's
+// line holds 3.605 mL and the peristaltic rollers keep it charged between runs, so
+// the first thing a new sample's BASE_FILL pushes into the cell is the *previous*
+// sample — about 24% of the fill. A full rinse pass does clear it, but it spends
+// 15.65 mL of liquid and 31 s per pass, which hurts when stepping through several
+// samples (or three calibration buffers) by hand.
+//
+// The purge is the cheap version of the same idea: move pump 1's intake into the
+// new liquid, push 2x the line volume (7.21 mL — one line-volume to displace the
+// old liquid, one to sweep behind it), then run the normal full drain so the cell
+// is left empty and ready. Same 1-then-sweep logic as a prime, but it drains
+// afterwards instead of leaving the charge in the cell.
+//
+// It deliberately reuses RINSE_FILL/RINSE_DRAIN rather than adding FSM states: the
+// only difference from a rinse pass is the size of the charge.
+static constexpr float PURGE_OVERSHOOT = 2.0f;
+static constexpr float PURGE_FILL_ML = P1_LINE_ML * PURGE_OVERSHOOT;  // 7.21 mL
+static const uint32_t PURGE_FILL_MS_DEFAULT = pump1Ms(PURGE_FILL_ML);
+
+// ----- Shared fill/drain pass -----
+// Full drain, same as the measurement DRAIN_MS, and used by both the rinse and
+// the purge: it clears the larger of the two charges (the rinse's ~15.65 mL) plus
 // the 4.10 mL drain line in ~1.6 s, and the remaining air-purge tail strips
 // droplets off the floor and empties pump 3's outlet so nothing is left behind.
 static const uint32_t RINSE_DRAIN_MS = DRAIN_MS;
+
+// Which flavour of fill/drain pass is currently running. RINSE_FILL is shared by
+// the rinse and the changeover purge, so the duration and the UI label are held
+// here and set by startRinse()/startPurge() (and by the auto-rinse arming point)
+// rather than read straight off rinseFillMs.
+static uint32_t activeFillMs = RINSE_FILL_MS_DEFAULT;
+static bool activeIsPurge = false;
 
 static const uint32_t IDLE_MS = 3600000;
 static const uint8_t SENSOR_ZERO_RETRY_COUNT = 3;
@@ -801,8 +840,8 @@ static const char *getStateLabel(ProcessState state) {
         case ProcessState::DRAIN: return "Vacuum Drain";
     case ProcessState::COOL_DOWN: return "Cool Down";
     case ProcessState::PRIME: return "Line Prime";
-    case ProcessState::RINSE_FILL: return "Rinse Fill";
-    case ProcessState::RINSE_DRAIN: return "Rinse Drain";
+    case ProcessState::RINSE_FILL: return activeIsPurge ? "Purge Fill" : "Rinse Fill";
+    case ProcessState::RINSE_DRAIN: return activeIsPurge ? "Purge Drain" : "Rinse Drain";
         default: return "Idle";
     }
 }
@@ -818,8 +857,8 @@ static const char *getStateAction(ProcessState state) {
         case ProcessState::DRAIN: return "Evacuating chamber";
     case ProcessState::COOL_DOWN: return "Cooling pump";
     case ProcessState::PRIME: return "Filling supply line";
-    case ProcessState::RINSE_FILL: return "Flushing cell";
-    case ProcessState::RINSE_DRAIN: return "Clearing rinse water";
+    case ProcessState::RINSE_FILL: return activeIsPurge ? "Flushing line with new sample" : "Flushing cell";
+    case ProcessState::RINSE_DRAIN: return activeIsPurge ? "Clearing the old sample" : "Clearing rinse water";
         default: return "Idle wait";
     }
 }
@@ -837,7 +876,7 @@ static uint32_t getStateDuration(ProcessState state) {
         case ProcessState::DRAIN: return DRAIN_MS;
     case ProcessState::COOL_DOWN: return COOL_DOWN_MS;
     case ProcessState::PRIME: return primeMs;
-    case ProcessState::RINSE_FILL: return rinseFillMs;
+    case ProcessState::RINSE_FILL: return activeFillMs;
     case ProcessState::RINSE_DRAIN: return RINSE_DRAIN_MS;
         case ProcessState::IDLE: return IDLE_MS;
         default: return 0;
@@ -868,6 +907,8 @@ static String buildStatusJson() {
     doc["rinseCycles"] = rinseCycles;
     doc["rinseFillMs"] = rinseFillMs;
     doc["rinseRemaining"] = rinseRemaining;
+    doc["purgeActive"] = activeIsPurge && (currentState == ProcessState::RINSE_FILL ||
+                                           currentState == ProcessState::RINSE_DRAIN);
 
     // Fluidics: derived volumes so the dashboard can show what the current
     // timings actually deliver instead of restating the raw milliseconds.
@@ -879,6 +920,9 @@ static String buildStatusJson() {
     fluid["dyeLineMl"] = P2_LINE_ML;
     fluid["primeDyeMs"] = PRIME_DYE_MS_DEFAULT;
     fluid["primeWaterMs"] = PRIME_WATER_MS_DEFAULT;
+    fluid["waterLineMl"] = P1_LINE_ML;
+    fluid["purgeFillMs"] = PURGE_FILL_MS_DEFAULT;
+    fluid["purgeFillMl"] = PURGE_FILL_ML;
 
     doc["baselineValid"] = baselineValid;
     doc["sampleValid"] = sampleValid;
@@ -1034,7 +1078,24 @@ static bool startRinse(uint8_t cycles) {
     }
     if (cycles < 1) cycles = 1;
     if (cycles > RINSE_CYCLES_MAX) cycles = RINSE_CYCLES_MAX;
+    activeFillMs = rinseFillMs;
+    activeIsPurge = false;
     rinseRemaining = cycles;
+    setState(ProcessState::RINSE_FILL);
+    return true;
+}
+
+// Kick off a sample-changeover purge: one short fill (2x pump 1's line volume)
+// followed by the full drain, so the line and cell hold the new liquid instead of
+// the previous one. Cheaper than a rinse pass in both time and sample volume —
+// use it after moving pump 1's intake to a new sample or buffer. Idle only.
+static bool startPurge() {
+    if (currentState != ProcessState::IDLE) {
+        return false;
+    }
+    activeFillMs = PURGE_FILL_MS_DEFAULT;
+    activeIsPurge = true;
+    rinseRemaining = 1;
     setState(ProcessState::RINSE_FILL);
     return true;
 }
@@ -1076,6 +1137,7 @@ static void handleWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
     if (currentState != ProcessState::IDLE) {
       Serial.printf("[%lu] Abort requested via WebSocket; draining.\n", millis());
       rinseRemaining = 0;  // an explicit abort should not trigger the auto-rinse
+      activeIsPurge = false;  // and it should not leave the purge labels armed
       setState(ProcessState::DRAIN);
     }
     sendStatusToClient(client);
@@ -1222,10 +1284,12 @@ static void setupServer() {
     });
 
     // Fill a supply line so dead volume is known rather than guessed.
-    //   GET /api/prime?pump=dye|water[&ms=4127]
-    // Defaults come from the measured tube lengths at 2x line volume, so the
-    // second pass sweeps trapped air out of the tip. Run with the cell empty and
-    // drain afterwards — the overshoot lands inside.
+    //   GET /api/prime?pump=dye|water[&ms=3095]
+    // Defaults come from the measured tube lengths, with enough overshoot past
+    // one line volume to sweep trapped air out of the tip: water 2x (7.21 mL,
+    // 11692 ms) because it is free and its line is long, dye 1.5x (1.91 mL,
+    // 3095 ms) because the reagent is not. Run with the cell empty and drain
+    // afterwards — the overshoot lands inside.
     server.on("/api/prime", HTTP_GET, [](AsyncWebServerRequest *request) {
       bool useDye = true;
       if (request->hasParam("pump")) {
@@ -1290,7 +1354,29 @@ static void setupServer() {
       request->send(200, "application/json", payload);
     });
 
-    // Replace the whole hue->pH table. Also accepts an optional branch-cut.
+    // Swap the liquid under test without wasting a full rinse pass.
+    //   GET /api/purge
+    // Pushes 2x pump 1's line volume (7.21 mL) through the line and cell, then
+    // drains — so the previous sample is displaced instead of showing up as ~24%
+    // of the next BASE_FILL. Run it right after moving pump 1's intake into the
+    // new sample. Only allowed from idle (409 otherwise).
+    server.on("/api/purge", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (!startPurge()) {
+        request->send(409, "application/json",
+                      "{\"error\":\"busy; purge is only allowed from idle\"}");
+        return;
+      }
+
+      JsonDocument doc;
+      doc["purgeFillMs"] = PURGE_FILL_MS_DEFAULT;
+      doc["purgeFillMl"] = PURGE_FILL_ML;
+      doc["purgeDrainMs"] = RINSE_DRAIN_MS;
+      String payload;
+      serializeJson(doc, payload);
+      request->send(200, "application/json", payload);
+    });
+
+    // Replace the whole hue->pH table. Also accepts an optional branch cut.
     //   GET /api/calibrate?points=4.01:35,6.86:95,9.18:180[&hueCut=320]
     server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest *request) {
       if (request->hasParam("hueCut")) {
@@ -1493,6 +1579,8 @@ static void runStateMachine() {
                 // Sensor-error paths above drain directly and leave rinseRemaining
                 // at 0 regardless.
                 rinseRemaining = rinseCycles;
+                activeFillMs = rinseFillMs;
+                activeIsPurge = false;
                 setState(ProcessState::DRAIN);
             }
             break;
@@ -1510,7 +1598,7 @@ static void runStateMachine() {
             break;
 
         case ProcessState::RINSE_FILL:
-            if (now - stateStartMs >= rinseFillMs) {
+            if (now - stateStartMs >= activeFillMs) {
                 setState(ProcessState::RINSE_DRAIN);
             }
             break;
@@ -1524,6 +1612,9 @@ static void runStateMachine() {
                 if (rinseRemaining > 0) {
                     setState(ProcessState::RINSE_FILL);
                 } else {
+                    // Whole pass finished: hand the shared states back to the
+                    // rinse so a later entry can never inherit purge labels.
+                    activeIsPurge = false;
                     setState(ProcessState::COOL_DOWN);
                 }
             }
@@ -1683,6 +1774,8 @@ void setup() {
       Serial.printf("[CFG]    Rinse:        %u auto cycle(s), fill %u ms (%.2f mL)\n",
                     rinseCycles, rinseFillMs, rinseFillMs * PUMP_ML_PER_S / 1000.0f);
     }
+    Serial.printf("[CFG]    Purge:        %u ms (%.2f mL) - /api/purge after a sample swap\n",
+                  PURGE_FILL_MS_DEFAULT, PURGE_FILL_ML);
     Serial.printf("[CFG]    Hue branch:   %.1f deg\n", hueBranchCut);
     Serial.printf("[CFG]    Cal points:   %u  (pH %.2f-%.2f)\n",
                   calCount,

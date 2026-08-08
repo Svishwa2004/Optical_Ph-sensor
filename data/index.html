@@ -382,7 +382,8 @@ header {
         <input id="rinseCyclesInput" class="config-input" type="number" min="0" max="5" step="1" value="0"/>
         <button id="rinseApply" class="config-button" type="button">Apply</button>
         <button id="rinseNowBtn" class="config-button" type="button">Rinse now</button>
-        <div id="rinseHint" class="config-hint">Flushes dye carryover after each run. 0 disables the auto-rinse.</div>
+        <button id="purgeNowBtn" class="config-button" type="button">Purge (new sample)</button>
+        <div id="rinseHint" class="config-hint">Rinse flushes dye carryover after a run; 0 disables the auto-rinse. Purge swaps the sample sitting in pump 1's line.</div>
       </div>
 
       <div class="calpanel">
@@ -505,6 +506,7 @@ const primeWarn = document.getElementById("primeWarn");
 const rinseCyclesInput = document.getElementById("rinseCyclesInput");
 const rinseApply = document.getElementById("rinseApply");
 const rinseNowBtn = document.getElementById("rinseNowBtn");
+const purgeNowBtn = document.getElementById("purgeNowBtn");
 const rinseHint = document.getElementById("rinseHint");
 const calCapturePh = document.getElementById("calCapturePh");
 const calCaptureBtn = document.getElementById("calCaptureBtn");
@@ -638,6 +640,7 @@ function updateRinseUI(d) {
   }
   const busy = d.state !== "Idle" && d.stateId !== 0;
   rinseNowBtn.disabled = busy;
+  purgeNowBtn.disabled = busy;
   rinseApply.disabled = busy;
 }
 
@@ -681,6 +684,28 @@ function runRinse() {
     })
     .catch((err) => {
       rinseHint.textContent = err.message || "Rinse failed";
+      rinseHint.classList.add("error");
+    });
+}
+
+// Sample changeover: push 2x pump 1's line volume through and drain, so the new
+// liquid replaces the old one in the line instead of leading the next fill.
+function runPurge() {
+  rinseHint.textContent = "Purging line with the new sample...";
+  rinseHint.classList.remove("error");
+  fetch(`/api/purge`)
+    .then((res) => {
+      if (res.status === 409) throw new Error("Device busy - wait for idle");
+      if (!res.ok) throw new Error("Request failed");
+      return res.json();
+    })
+    .then((payload) => {
+      const ml = payload && typeof payload.purgeFillMl === "number"
+        ? `${payload.purgeFillMl.toFixed(2)} mL` : "the line volume";
+      rinseHint.textContent = `Purging ${ml} through the line, then draining...`;
+    })
+    .catch((err) => {
+      rinseHint.textContent = err.message || "Purge failed";
       rinseHint.classList.add("error");
     });
 }
@@ -948,6 +973,7 @@ rinseCyclesInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") applyRinseCycles();
 });
 rinseNowBtn.addEventListener("click", runRinse);
+purgeNowBtn.addEventListener("click", runPurge);
 
 calPointsApply.addEventListener("click", applyCalibrationPoints);
 calPointsInput.addEventListener("keydown", (event) => {
