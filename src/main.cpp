@@ -179,6 +179,38 @@ static const uint32_t MEASURE_SAMPLE_MS = 1000;
 // ~1.6 s; the balance is air purge that strips residual droplets off the floor.
 static const uint32_t DRAIN_MS = 6000;
 static const uint32_t COOL_DOWN_MS = 10000;
+
+// ----- Rinse (post-cycle flush) -----
+// A completed measurement leaves dyed residue clinging to the cell walls, the
+// optical windows, and pump 3's 0.85 mL inlet. Left there it tints the next
+// BLANKING baseline, and because every reading is measured against that baseline
+// the whole cycle drifts. A rinse pass fills the cell with clean sample water and
+// drains again, diluting the residue ~15-25x per pass and pushing fresh water
+// through the drain line. rinseCycles passes run automatically after the
+// measurement drain (0 disables the auto-rinse); a rinse can also be triggered
+// manually from idle via /api/rinse. It is kept deliberately short: a partial
+// fill (not the full operating volume) plus a shortened drain make it quick and
+// keep the noisy R385 running only briefly.
+static const uint8_t  RINSE_CYCLES_DEFAULT = 1;
+static const uint8_t  RINSE_CYCLES_MAX = 5;
+static uint8_t rinseCycles    = RINSE_CYCLES_DEFAULT; // 0 = no automatic rinse
+static uint8_t rinseRemaining = 0;                    // passes left in the active rinse
+
+// Fill only enough to submerge the optical windows and dilute what clings to
+// them — the rinse targets carryover, not measurement, so it needn't reach the
+// full 15.65 mL operating level. BENCH-VERIFY this crests the windows; if a film
+// is left above the rinse line, raise rinseFillMs. 12 mL at nominal is ~19.5 s.
+static constexpr float RINSE_FILL_ML = 12.0f;
+static const uint32_t RINSE_FILL_MS_DEFAULT = pump1Ms(RINSE_FILL_ML);
+static const uint32_t RINSE_FILL_MS_MIN = 2000;
+static const uint32_t RINSE_FILL_MS_MAX = 60000;
+static uint32_t rinseFillMs = RINSE_FILL_MS_DEFAULT;
+
+// Shorter than the measurement DRAIN_MS: a rinse doesn't need the long air-purge
+// tail, so it stays quick and the R385 runs for less time. The pump clears the
+// 12 mL charge plus the 4.10 mL line in ~1.2 s, leaving an ample purge margin.
+static const uint32_t RINSE_DRAIN_MS = 4000;
+
 static const uint32_t IDLE_MS = 3600000;
 static const uint8_t SENSOR_ZERO_RETRY_COUNT = 3;
 static const uint16_t SENSOR_ZERO_RETRY_DELAY_MS = 50;
@@ -252,7 +284,9 @@ enum class ProcessState : uint8_t {
     MEASURE = 6,
   DRAIN = 7,
   COOL_DOWN = 8,
-  PRIME = 9
+  PRIME = 9,
+  RINSE_FILL = 10,
+  RINSE_DRAIN = 11
 };
 
 struct RawReading {
@@ -355,6 +389,8 @@ static void saveSettings() {
   preferences.putUInt("baseFillMs", baseFillMs);
   preferences.putUChar("drainDuty", drainDutyPercent);
   preferences.putUInt("doseMs", doseMs);
+  preferences.putUChar("rinseCycles", rinseCycles);
+  preferences.putUInt("rinseFillMs", rinseFillMs);
   preferences.putFloat("hueCut", hueBranchCut);
   preferences.putUChar("calCount", calCount);
   preferences.putBytes("calPoints", calPoints, calCount * sizeof(CalPoint));
@@ -404,6 +440,18 @@ static void loadSettings() {
     if (storedDose < DOSE_MS_MIN) storedDose = DOSE_MS_MIN;
     if (storedDose > DOSE_MS_MAX) storedDose = DOSE_MS_MAX;
     doseMs = storedDose;
+  }
+
+  if (preferences.isKey("rinseCycles")) {
+    uint8_t storedCycles = preferences.getUChar("rinseCycles", RINSE_CYCLES_DEFAULT);
+    rinseCycles = (storedCycles > RINSE_CYCLES_MAX) ? RINSE_CYCLES_MAX : storedCycles;
+  }
+
+  if (preferences.isKey("rinseFillMs")) {
+    uint32_t storedRinseFill = preferences.getUInt("rinseFillMs", RINSE_FILL_MS_DEFAULT);
+    if (storedRinseFill < RINSE_FILL_MS_MIN) storedRinseFill = RINSE_FILL_MS_MIN;
+    if (storedRinseFill > RINSE_FILL_MS_MAX) storedRinseFill = RINSE_FILL_MS_MAX;
+    rinseFillMs = storedRinseFill;
   }
 
   if (preferences.isKey("hueCut")) {
@@ -474,6 +522,26 @@ static uint32_t setDoseMs(uint32_t requested, bool persist = true) {
     saveSettings();
   }
   return doseMs;
+}
+
+static uint8_t setRinseCycles(int cycles, bool persist = true) {
+  if (cycles < 0) cycles = 0;
+  if (cycles > RINSE_CYCLES_MAX) cycles = RINSE_CYCLES_MAX;
+  rinseCycles = static_cast<uint8_t>(cycles);
+  if (persist) {
+    saveSettings();
+  }
+  return rinseCycles;
+}
+
+static uint32_t setRinseFillMs(uint32_t requested, bool persist = true) {
+  if (requested < RINSE_FILL_MS_MIN) requested = RINSE_FILL_MS_MIN;
+  if (requested > RINSE_FILL_MS_MAX) requested = RINSE_FILL_MS_MAX;
+  rinseFillMs = requested;
+  if (persist) {
+    saveSettings();
+  }
+  return rinseFillMs;
 }
 
 // Replace the whole calibration table atomically. Validates before committing so
@@ -709,6 +777,8 @@ static const char *getStateLabel(ProcessState state) {
         case ProcessState::DRAIN: return "Vacuum Drain";
     case ProcessState::COOL_DOWN: return "Cool Down";
     case ProcessState::PRIME: return "Line Prime";
+    case ProcessState::RINSE_FILL: return "Rinse Fill";
+    case ProcessState::RINSE_DRAIN: return "Rinse Drain";
         default: return "Idle";
     }
 }
@@ -724,6 +794,8 @@ static const char *getStateAction(ProcessState state) {
         case ProcessState::DRAIN: return "Evacuating chamber";
     case ProcessState::COOL_DOWN: return "Cooling pump";
     case ProcessState::PRIME: return "Filling supply line";
+    case ProcessState::RINSE_FILL: return "Flushing cell";
+    case ProcessState::RINSE_DRAIN: return "Clearing rinse water";
         default: return "Idle wait";
     }
 }
@@ -741,6 +813,8 @@ static uint32_t getStateDuration(ProcessState state) {
         case ProcessState::DRAIN: return DRAIN_MS;
     case ProcessState::COOL_DOWN: return COOL_DOWN_MS;
     case ProcessState::PRIME: return primeMs;
+    case ProcessState::RINSE_FILL: return rinseFillMs;
+    case ProcessState::RINSE_DRAIN: return RINSE_DRAIN_MS;
         case ProcessState::IDLE: return IDLE_MS;
         default: return 0;
     }
@@ -767,6 +841,9 @@ static String buildStatusJson() {
     doc["baseFillSec"] = baseFillMs / 1000;
     doc["doseMs"] = doseMs;
     doc["dyeLinePrimed"] = dyeLinePrimed;
+    doc["rinseCycles"] = rinseCycles;
+    doc["rinseFillMs"] = rinseFillMs;
+    doc["rinseRemaining"] = rinseRemaining;
 
     // Fluidics: derived volumes so the dashboard can show what the current
     // timings actually deliver instead of restating the raw milliseconds.
@@ -875,6 +952,7 @@ static void setState(ProcessState next) {
     stateStartMs = millis();
 
     if (next == ProcessState::BASE_FILL) {
+        rinseRemaining = 0;  // fresh cycle: no rinse queued until MEASURE succeeds
         pump1On(true);
     } else if (next == ProcessState::BLANKING) {
         ledOn(true);         // LED on — begins thermal stabilisation
@@ -892,6 +970,10 @@ static void setState(ProcessState next) {
         sampleValid = false;
     } else if (next == ProcessState::DRAIN) {
         pump3On(true);       // LED off via setAllOutputsOff() above — measurement done
+    } else if (next == ProcessState::RINSE_FILL) {
+        pump1On(true);       // clean water into the cell to dilute dyed residue
+    } else if (next == ProcessState::RINSE_DRAIN) {
+        pump3On(true);       // evacuate the rinse water (and flush the drain line)
     } else if (next == ProcessState::PRIME) {
         // Priming is not metered, so drive the selected pump at full duty.
         if (primeUsesDyePump) {
@@ -915,6 +997,21 @@ static bool startPrime(bool useDyePump, uint32_t ms) {
     primeUsesDyePump = useDyePump;
     primeMs = ms;
     setState(ProcessState::PRIME);
+    return true;
+}
+
+// Kick off a manual rinse (fill clean water, drain, repeat). Only legal from IDLE
+// so it can never interrupt a measurement. `cycles` passes run, clamped 1..MAX;
+// the sequence ends in COOL_DOWN so the drain pump gets its usual rest. Returns
+// false if busy; the caller reports that as 409.
+static bool startRinse(uint8_t cycles) {
+    if (currentState != ProcessState::IDLE) {
+        return false;
+    }
+    if (cycles < 1) cycles = 1;
+    if (cycles > RINSE_CYCLES_MAX) cycles = RINSE_CYCLES_MAX;
+    rinseRemaining = cycles;
+    setState(ProcessState::RINSE_FILL);
     return true;
 }
 
@@ -954,6 +1051,7 @@ static void handleWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *c
     // Abort mid-cycle: drain the flow cell and return to idle.
     if (currentState != ProcessState::IDLE) {
       Serial.printf("[%lu] Abort requested via WebSocket; draining.\n", millis());
+      rinseRemaining = 0;  // an explicit abort should not trigger the auto-rinse
       setState(ProcessState::DRAIN);
     }
     sendStatusToClient(client);
@@ -1075,12 +1173,24 @@ static void setupServer() {
         setDoseMs((uint32_t)(ms < 0 ? 0 : ms));
       }
 
+      if (request->hasParam("rinseCycles")) {
+        int cycles = request->getParam("rinseCycles")->value().toInt();
+        setRinseCycles(cycles);
+      }
+
+      if (request->hasParam("rinseFillMs")) {
+        long ms = request->getParam("rinseFillMs")->value().toInt();
+        setRinseFillMs((uint32_t)(ms < 0 ? 0 : ms));
+      }
+
       JsonDocument doc;
       doc["baseFillMs"] = baseFillMs;
       doc["baseFillSec"] = baseFillMs / 1000;
       doc["doseMs"] = doseMs;
       doc["drainDutyPercent"] = drainDutyPercent;
       doc["drainDutyRaw"] = drainPwmDuty;
+      doc["rinseCycles"] = rinseCycles;
+      doc["rinseFillMs"] = rinseFillMs;
       String payload;
       serializeJson(doc, payload);
       broadcastStatus();
@@ -1123,6 +1233,33 @@ static void setupServer() {
       doc["pump"] = useDye ? "dye" : "water";
       doc["primeMs"] = primeMs;
       doc["lineMl"] = useDye ? P2_LINE_ML : P1_LINE_ML;
+      String payload;
+      serializeJson(doc, payload);
+      request->send(200, "application/json", payload);
+    });
+
+    // Flush the cell with clean water to clear dye carryover before the next run.
+    //   GET /api/rinse[&cycles=1]
+    // Runs `cycles` fill+drain passes (default rinseCycles, min 1), then cools
+    // down. Only allowed from idle (409 otherwise). This is the manual twin of
+    // the automatic rinse that already follows every successful measurement.
+    server.on("/api/rinse", HTTP_GET, [](AsyncWebServerRequest *request) {
+      uint8_t cycles = (rinseCycles < 1) ? 1 : rinseCycles;
+      if (request->hasParam("cycles")) {
+        int requested = request->getParam("cycles")->value().toInt();
+        if (requested > 0) cycles = (uint8_t)requested;
+      }
+
+      if (!startRinse(cycles)) {
+        request->send(409, "application/json",
+                      "{\"error\":\"busy; rinse is only allowed from idle\"}");
+        return;
+      }
+
+      JsonDocument doc;
+      doc["cycles"] = rinseRemaining;
+      doc["rinseFillMs"] = rinseFillMs;
+      doc["rinseDrainMs"] = RINSE_DRAIN_MS;
       String payload;
       serializeJson(doc, payload);
       request->send(200, "application/json", payload);
@@ -1325,13 +1462,43 @@ static void runStateMachine() {
                     }
                 }
 
+                // A clean reading just completed — queue the post-cycle rinse so
+                // DRAIN hands off to it instead of COOL_DOWN. Sensor-error paths
+                // above drain directly and leave rinseRemaining at 0 (no rinse).
+                rinseRemaining = rinseCycles;
                 setState(ProcessState::DRAIN);
             }
             break;
 
         case ProcessState::DRAIN:
             if (now - stateStartMs >= DRAIN_MS) {
-            setState(ProcessState::COOL_DOWN);
+            // A completed measurement queues rinseCycles passes; run them before
+            // cooling down. An aborted/errored drain leaves rinseRemaining at 0.
+            if (rinseRemaining > 0) {
+              setState(ProcessState::RINSE_FILL);
+            } else {
+              setState(ProcessState::COOL_DOWN);
+            }
+            }
+            break;
+
+        case ProcessState::RINSE_FILL:
+            if (now - stateStartMs >= rinseFillMs) {
+                setState(ProcessState::RINSE_DRAIN);
+            }
+            break;
+
+        case ProcessState::RINSE_DRAIN:
+            if (now - stateStartMs >= RINSE_DRAIN_MS) {
+                // One pass done. More queued -> fill again; otherwise cool down.
+                if (rinseRemaining > 0) {
+                    rinseRemaining--;
+                }
+                if (rinseRemaining > 0) {
+                    setState(ProcessState::RINSE_FILL);
+                } else {
+                    setState(ProcessState::COOL_DOWN);
+                }
             }
             break;
 
@@ -1481,6 +1648,8 @@ void setup() {
                   P2_LINE_ML, PRIME_DYE_MS_DEFAULT);
     Serial.printf("[CFG]    Dye primed:   %s\n", dyeLinePrimed ? "yes" : "NO - run /api/prime?pump=dye");
     Serial.printf("[CFG]    Drain duty:   %u %%\n", drainDutyPercent);
+    Serial.printf("[CFG]    Rinse:        %u cycle(s), fill %u ms (%.2f mL)\n",
+                  rinseCycles, rinseFillMs, rinseFillMs * PUMP_ML_PER_S / 1000.0f);
     Serial.printf("[CFG]    Hue branch:   %.1f deg\n", hueBranchCut);
     Serial.printf("[CFG]    Cal points:   %u  (pH %.2f-%.2f)\n",
                   calCount,
