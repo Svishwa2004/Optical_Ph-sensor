@@ -104,6 +104,28 @@ header {
   font-weight: 700;
   letter-spacing: -1px;
 }
+.ph .value.novalue {
+  color: var(--muted);
+  opacity: 0.55;
+}
+.ph .swatch {
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: repeating-linear-gradient(45deg, #eee 0 6px, #e2e2e2 6px 12px);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.15);
+  align-self: center;
+  flex: 0 0 auto;
+  transition: background 0.4s ease;
+}
+.phnote {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+  margin-top: -6px;
+  min-height: 18px;
+}
 .ph .unit {
   font-size: 18px;
   color: var(--muted);
@@ -342,10 +364,12 @@ header {
   <div class="grid">
     <section class="panel hero">
       <div class="ph">
-        <div id="phValue" class="value">--.--</div>
+        <div id="colorSwatch" class="swatch" title="Live sample colour"></div>
+        <div id="phValue" class="value novalue">—</div>
         <div class="unit">pH</div>
         <div id="extrapBadge" class="badge" hidden>extrapolated</div>
       </div>
+      <div id="phNote" class="phnote">Connecting…</div>
       <div class="state">
         <div class="label">Current Process</div>
         <div id="stateName" class="name">Waiting</div>
@@ -735,6 +759,9 @@ function updateCalibrationUI(d) {
   } else {
     calSpan.textContent = `${points.length} pts`;
   }
+  if (cal.fromBench === false) {
+    calSpan.textContent += " · placeholder (not bench-calibrated)";
+  }
 
   if (document.activeElement !== calPointsInput) {
     calPointsInput.value = points
@@ -888,14 +915,42 @@ function updateStartButton(d) {
   }
 }
 
+// Paint the live colour swatch from the measured hue. This shows the REAL colour
+// the indicator turned even on cycles where the pH is withheld, so the booth demo
+// always looks like something happened. Illustrative only: hue is the measured
+// value, saturation is scaled up from the (transmittance-based) measured S so a
+// weak-but-real colour is still visible while a truly grey sample stays muted.
+function updateColorSwatch(d) {
+  const sw = document.getElementById("colorSwatch");
+  if (!sw) return;
+  const hsv = d.hsv || {};
+  const h = hsv.h;
+  const s = hsv.s;
+  if (h === null || h === undefined || Number.isNaN(h)) {
+    sw.style.background = "repeating-linear-gradient(45deg, #eee 0 6px, #e2e2e2 6px 12px)";
+    return;
+  }
+  const sPct = Math.max(18, Math.min(90, (s || 0) * 140));
+  sw.style.background = `hsl(${h}, ${sPct}%, 55%)`;
+}
+
 function updateUI(d) {
   lastStatus = d;
-  document.getElementById("phValue").textContent = fmtNumber(d.ph, 2);
+  const phEl = document.getElementById("phValue");
+  const hasPh = d.ph !== null && d.ph !== undefined && !Number.isNaN(d.ph);
+  phEl.textContent = hasPh ? fmtNumber(d.ph, 2) : "—";
+  phEl.classList.toggle("novalue", !hasPh);
+
+  const noteEl = document.getElementById("phNote");
+  if (noteEl) noteEl.textContent = d.phNote || (hasPh ? "" : "");
+
+  updateColorSwatch(d);
+
   document.getElementById("stateName").textContent = d.state || "--";
   document.getElementById("stateAction").textContent = d.action || "--";
 
   const badge = document.getElementById("extrapBadge");
-  badge.hidden = !(d.extrapolated && d.ph !== null && d.ph !== undefined);
+  badge.hidden = !(d.extrapolated && hasPh);
 
   updateBaseFillUI(d);
   updateDoseUI(d);

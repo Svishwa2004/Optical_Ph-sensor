@@ -110,6 +110,21 @@ static constexpr uint32_t pump2Ms(float ml) {
 // metering duty — so a dye prime must be timed with this, not with pump2Ms().
 static constexpr uint32_t pumpFullMs(float ml) { return pump1Ms(ml); }
 
+// ----- Exhibition / demo mode -----
+// EXHIBITION_MODE = 1 builds the university-exhibit version: it trims ONLY the two
+// waits that the chemistry and optics do not need, so a judge watching sees
+// fill -> colour change -> reading in well under a minute instead of ~63 s. Set it
+// to 0 to restore the full lab timings. Nothing that affects the reading is touched
+// by this flag: BASE_FILL still crests the optical windows, BLANKING still lets the
+// LEDs reach thermal steady state, the dose and agitation still deliver real
+// volumes, and MEASURE still integrates its 10 samples. Only DIFFUSION (a passive
+// settle wait, no pump running) and COOL_DOWN (an idle pump-rest between cycles)
+// are shortened. Each affected constant below keeps its original lab value inline,
+// so reverting is a one-character edit. See DIFFUSION_MS and COOL_DOWN_MS.
+#ifndef EXHIBITION_MODE
+#define EXHIBITION_MODE 1
+#endif
+
 // ----- Timing (ms) -----
 // Geometry predicts pump1Ms(15.65 mL) = 25378 ms at the nominal 0.6167 mL/s.
 // Overridden to 24000 ms at the user's request (bench run showed 25 s a touch
@@ -197,13 +212,29 @@ static bool dyeLinePrimed = false;               // cleared on every boot
 // 1.10 mL at 0.6167 mL/s. No dead-volume term: the pump-1 line is already full
 // from BASE_FILL, so this is pure delivered volume.
 static const uint32_t AGITATION_MS = pump1Ms(AGITATION_ML);
+// DIFFUSION is a passive settle wait — no pump runs, the dye just finishes mixing
+// and the meniscus goes still before MEASURE. It has no fluidic or optical minimum,
+// so it is safe to shorten for a live demo. Lab value 15000; exhibit trims it to
+// 4000 (still long enough for a well-agitated 0.34 mL dose to even out).
+#if EXHIBITION_MODE
+static const uint32_t DIFFUSION_MS = 4000;   // exhibit: trimmed from the 15000 lab value
+#else
 static const uint32_t DIFFUSION_MS = 15000;
+#endif
 static const uint32_t MEASURE_WARMUP_MS = 1000;
 static const uint32_t MEASURE_SAMPLE_MS = 1000;
 // R385 at ~13.3 mL/s clears the 17.09 mL cell plus the 4.10 mL drain path in
 // ~1.6 s; the balance is air purge that strips residual droplets off the floor.
 static const uint32_t DRAIN_MS = 6000;
+// COOL_DOWN is an idle pump-rest between cycles — nothing is measured or moved, it
+// just spaces successive runs so the pump drivers are not restarted back-to-back.
+// Safe to shorten for a booth where cycles are run on demand. Lab value 10000;
+// exhibit trims it to 3000.
+#if EXHIBITION_MODE
+static const uint32_t COOL_DOWN_MS = 3000;   // exhibit: trimmed from the 10000 lab value
+#else
 static const uint32_t COOL_DOWN_MS = 10000;
+#endif
 
 // ----- Rinse (post-cycle flush) -----
 // A completed measurement leaves dyed residue clinging to the cell walls, the
@@ -307,6 +338,11 @@ static CalPoint calPoints[CAL_MAX_POINTS] = {
     {12.0f, 280.0f},
 };
 static uint8_t calCount = 6;
+// false while the PLACEHOLDER table above is in use, true once a real bench table
+// is loaded from NVS or captured against buffers. Drives the honest "provisional"
+// caption on the dashboard — the placeholder maps hue to plausible-looking pH but
+// those numbers are not calibrated to this cell's optics.
+static bool calFromBench = false;
 
 // Hue branch cut (degrees). Hues at/above this threshold are shifted down by 360
 // so the red (acidic) end reads as a small/negative value and the whole ramp
@@ -409,6 +445,10 @@ static float lastHue = NAN;       // unwrapped hue in degrees
 static float lastSat = NAN;       // saturation [0,1]
 static float lastVal = NAN;       // value [0,1]
 static bool lastExtrapolated = false;  // pH outside calibrated span?
+// Human-readable status for the pH tile. Set alongside lastPh in MEASURE so the
+// dashboard can show WHY a reading is or isn't trustworthy instead of a bare "--".
+// Kept honest: it never invents a pH, it explains the state of the current reading.
+static String phNote = "";
 
 // ----- Web UI -----
 // Served from LittleFS at /index.html.
@@ -533,6 +573,7 @@ static void loadSettings() {
       if (got == want && validateCalPoints(tmp, storedCount)) {
         memcpy(calPoints, tmp, want);
         calCount = storedCount;
+        calFromBench = true;  // a real bench table replaced the placeholder
       } else {
         Serial.println("Stored calibration table invalid; keeping defaults.");
       }
@@ -615,6 +656,7 @@ static bool setCalibrationPoints(const CalPoint *pts, uint8_t count, bool persis
   }
   memcpy(calPoints, pts, count * sizeof(CalPoint));
   calCount = count;
+  calFromBench = true;  // captured/entered against buffers — no longer placeholder
   if (persist) {
     saveSettings();
   }
@@ -937,6 +979,7 @@ static String buildStatusJson() {
     JsonObject calibrationObj = doc["calibration"].to<JsonObject>();
     calibrationObj["hueBranchCut"] = hueBranchCut;
     calibrationObj["count"] = calCount;
+    calibrationObj["fromBench"] = calFromBench;  // false = placeholder table in use
     calibrationObj["phMin"] = calCount > 0 ? calPoints[0].ph : (float)NAN;
     calibrationObj["phMax"] = calCount > 0 ? calPoints[calCount - 1].ph : (float)NAN;
     JsonArray pointsArr = calibrationObj["points"].to<JsonArray>();
@@ -952,6 +995,7 @@ static String buildStatusJson() {
         doc["ph"] = lastPh;
     }
     doc["extrapolated"] = lastExtrapolated;
+    doc["phNote"] = phNote;  // honest caption for the pH tile (never a fabricated number)
 
     // HSV telemetry (drives the reading now; ratio kept for diagnostics).
     JsonObject hsvObj = doc["hsv"].to<JsonObject>();
@@ -1021,6 +1065,7 @@ static void setState(ProcessState next) {
 
     if (next == ProcessState::BASE_FILL) {
         rinseRemaining = 0;  // fresh cycle: no rinse queued until MEASURE succeeds
+        phNote = "Measuring…";  // cleared/replaced when MEASURE decides the reading
         pump1On(true);
     } else if (next == ProcessState::BLANKING) {
         ledOn(true);         // LED on — begins thermal stabilisation
@@ -1530,6 +1575,7 @@ static void runStateMachine() {
               lastSat = NAN;
               lastVal = NAN;
               lastExtrapolated = false;
+              phNote = "Sensor read error — reading aborted, draining.";
               Serial.printf("[%lu] [MEAS]  FAILED — sensor read error. Draining.\n", millis());
               setState(ProcessState::DRAIN);
               break;
@@ -1556,6 +1602,8 @@ static void runStateMachine() {
                     if (isnan(hsv.h) || hsv.s < MIN_VALID_SATURATION || hsv.v < MIN_VALID_VALUE) {
                         lastPh = NAN;
                         lastExtrapolated = false;
+                        phNote = "No trustworthy pH — colour too weak or cell too dark. "
+                                 "Colour and absorbance shown below are live.";
                         Serial.printf("[%lu] [MEAS]  pH=NAN — sample too grey/dark "
                                       "(S<%.2f or V<%.2f). Check dose/lighting.\n",
                                       millis(), MIN_VALID_SATURATION, MIN_VALID_VALUE);
@@ -1565,8 +1613,18 @@ static void runStateMachine() {
                         lastPh = hueToPh(uh, extrap);
                         lastExtrapolated = extrap;
                         if (isnan(lastPh)) {
+                          phNote = "Colour measured, but no calibration table to map it to pH.";
                           Serial.printf("[%lu] [MEAS]  pH=NAN (check calibration table)\n", millis());
                         } else {
+                          if (!calFromBench) {
+                            phNote = extrap
+                              ? "Provisional (uncalibrated placeholder table) and outside its span."
+                              : "Provisional — placeholder table, not yet calibrated to this cell.";
+                          } else {
+                            phNote = extrap
+                              ? "Outside the calibrated buffer span — extrapolated."
+                              : "";
+                          }
                           Serial.printf("[%lu] [MEAS]  pH=%.2f%s\n", millis(), lastPh,
                                         extrap ? " (EXTRAPOLATED — outside calibrated span)" : "");
                         }
